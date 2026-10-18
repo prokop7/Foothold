@@ -34,7 +34,8 @@ local O = {
 	batteries = {},     -- [group] = { system, origin, target, at }
 	flights = {},       -- [group] = flight record (helicopters and jammers)
 	teams = {},         -- [group] = { kind = 'gun'|'ambush', ... } units a flight left behind
-	jams = {},          -- [jammer group] = { zone, side, jammed = { [unitName] = true } }
+	jams = {},          -- [jammer group] = { zone, side, own, ended, jammed = { [unitName] = true } }
+	ownJammers = {},    -- [group] = true for jammers Claude launched
 	counter = 0,
 }
 X.ops = O
@@ -68,6 +69,7 @@ local function firstTemplate(list)
 end
 
 local function groupAlive(name)
+	if not name then return false end
 	local g = Group.getByName(name)
 	return g ~= nil and g:isExist() and g:getSize() > 0
 end
@@ -117,6 +119,32 @@ end
 
 local function heloOrigin(z)
 	return (z.facility == 'airbase' or z.facility == 'farp' or z.facility == 'carrier') and z.isHeloSpawn
+end
+
+-- Foothold suspends zones nobody is near ("idle"). Like the BLUE shop, wake the
+-- target first: Foothold deletes launchers and jammers aimed at a suspended zone,
+-- and a suspended zone has no units to hit.
+local function wake(z)
+	if not z then return end
+	local hold = (GlobalSettings and tonumber(GlobalSettings.idleZoneWakeHoldSec)) or 120
+	z._idleWakeUntil = math.max(tonumber(z._idleWakeUntil) or 0, timer.getTime() + hold)
+	if z._idleSuspended and type(z.resume) == 'function' then pcall(z.resume, z) end
+end
+
+local function awake(z)
+	return z ~= nil and not z.suspended and not z._idleRestorePending
+end
+
+-- Runs fn(true) once zone z is awake, or fn(false) after waiting 2 minutes.
+local function whenAwake(z, fn)
+	local tries = 0
+	timer.scheduleFunction(function(_, t)
+		wake(z)
+		if awake(z) then fn(true) return nil end
+		tries = tries + 1
+		if tries > 24 then fn(false) return nil end
+		return t + 5
+	end, nil, timer.getTime() + 0.1)
 end
 
 local function spawnGround(template, alias, p2)
@@ -200,15 +228,24 @@ local function opsFile()
 	return FAI.dir .. 'ops_' .. U.sanitizeId((env.mission and env.mission.theatre or 'x') .. '_' .. tostring(b.saveFile)) .. '.lua'
 end
 
+local saveOps
 local function pruneDeployed()
 	local kept = {}
 	for _, d in ipairs(O.deployed) do
 		if groupAlive(d.group) then kept[#kept + 1] = d end
 	end
+	local removed = #O.deployed - #kept
 	O.deployed = kept
+	if removed > 0 and saveOps then saveOps() end   -- a destroyed group must not come back after a restart
 end
 
-local function saveOps()
+local function pruneTeams()
+	for name in pairs(O.teams) do
+		if not groupAlive(name) then O.teams[name] = nil end
+	end
+end
+
+function saveOps()
 	local path = opsFile()
 	if not path then return end
 	local list = {}
@@ -338,6 +375,7 @@ function O.fireMission(side, order)
 	if not (op and tp) then return false, 'zone position unknown' end
 	local km = dist2(op, tp) / 1000
 	if km > system.rangeKm then return false, string.format('%s is %d km away, %s reaches %d km', target.zone, round(km), order.system, system.rangeKm) end
+	if km < (system.minKm or 0) then return false, string.format('%s is only %d km away, %s needs at least %d km', target.zone, round(km), order.system, system.minKm) end
 	local readyAt = O.fireReadyAt[order.system] or 0
 	if now() < readyAt then return false, string.format('%s reloading, ready in %d min', order.system, math.ceil((readyAt - now()) / 60)) end
 	local price = priceOf(system.price)
@@ -349,15 +387,28 @@ function O.fireMission(side, order)
 	O.fireReadyAt[order.system] = now() + (system.cooldownSec or 1800)
 	O.batteries[name] = { system = order.system, origin = origin.zone, target = target.zone, at = now() }
 	X.charge(side, price, string.format('%s fire mission %s -> %s', order.system, origin.zone, target.zone))
+	wake(target)
 	timer.scheduleFunction(function()
-		if not groupAlive(name) then
-			X.event('red', 'fire_mission', { battery = name, target = target.zone, result = 'battery destroyed before firing' })
-			return nil
+		local function report(result)
+			X.event('red', 'fire_mission', { battery = name, system = order.system, target = target.zone, result = result })
+			X.eventPending.red = true
 		end
-		local ok, err = pcall(b.fireAtZone, b, target.zone, name, true, system.salvo or 1)
-		local result = (ok and not err) and 'fired' or ('not fired: ' .. tostring(err))
-		X.event('red', 'fire_mission', { battery = name, system = order.system, target = target.zone, result = result })
-		X.eventPending.red = true
+		if not groupAlive(name) then report('battery destroyed before firing') return nil end
+		whenAwake(target, function(isAwake)
+			if not groupAlive(name) then report('battery destroyed before firing') return end
+			if not isAwake then
+				X.refund(side, price, order.system .. ': target zone did not wake up')
+				report('not fired: target zone did not wake up (refunded)')
+				return
+			end
+			local ok, err = pcall(b.fireAtZone, b, target.zone, name, true, system.salvo or 1)
+			if ok and not err then
+				report('fired')
+			else
+				X.refund(side, price, order.system .. ' did not fire: ' .. tostring(err))
+				report('not fired: ' .. tostring(err) .. ' (refunded)')
+			end
+		end)
 		return nil
 	end, nil, timer.getTime() + ops.fireSetupSec)
 	timer.scheduleFunction(function()
@@ -373,6 +424,10 @@ if type(setAwacsRacetrack) == 'function' then
 	local original = setAwacsRacetrack
 	setAwacsRacetrack = function(side, coord, heading, leg, zoneName)
 		local st = O.awacsStation
+		if st then
+			local z = U.bcObj():getZoneByName(st.zone)
+			if not (z and z.side == RED) then O.awacsStation, st = nil, nil end   -- zone lost: Foothold places it again
+		end
 		if side == RED and st and X.controls(RED) and not O.settingAwacs then
 			return original(side, st.coord, st.heading, st.leg, st.zone)
 		end
@@ -500,8 +555,10 @@ local function startHeloFlight(kind, originZone, lz, extra)
 	local spawned, err = spawnFlight(template, name, op, ops.helo.altitudeM, ops.helo.speedKmh / 3.6,
 		heloRoute(op, lz, hold), 1)
 	if not spawned then return nil, err end
+	-- Out, hold, back, plus margin for take-off, landing and detours.
+	local timeout = math.floor(2 * km * 1000 / (ops.helo.speedKmh / 3.6) + hold + 900)
 	local f = { kind = kind, group = name, origin = originZone.zone, lz = lz, home = { x = op.x, z = op.z },
-		phase = 'outbound', at = now() }
+		phase = 'outbound', at = now(), timeoutSec = math.max(timeout, ops.helo.timeoutSec) }
 	for k, v in pairs(extra) do f[k] = v end
 	O.flights[name] = f
 	return f
@@ -530,12 +587,19 @@ local function onLanded(f, lead)
 		local gun = spawnGround(f.gunTemplate, f.group .. '-GUN', behind)
 		if not gun then return 'gun could not be unloaded' end
 		O.teams[gun] = { kind = 'gun', target = f.target, at = now() }
+		local b = U.bcObj()
+		local z = b:getZoneByName(f.target)
 		timer.scheduleFunction(function()
-			if not groupAlive(gun) then return nil end
-			local b = U.bcObj()
-			local ok, err = pcall(b.fireAtZone, b, f.target, gun, true, 4, math.max(1, math.floor(ops.raidRounds / 4)))
-			X.event('red', 'heli_raid', { gun = gun, target = f.target,
-				result = (ok and not err) and 'firing' or ('not firing: ' .. tostring(err)) })
+			if not groupAlive(gun) or not z then return nil end
+			whenAwake(z, function(isAwake)
+				if not groupAlive(gun) then return end
+				local ok, err = isAwake, 'target zone did not wake up'
+				if isAwake then ok, err = pcall(b.fireAtZone, b, f.target, gun, true, 4, math.max(1, math.floor(ops.raidRounds / 4))) end
+				local fired = ok and not err
+				if not fired then X.refund(RED, f.price, 'heli raid gun did not fire: ' .. tostring(err)) end
+				X.event('red', 'heli_raid', { gun = gun, target = f.target,
+					result = fired and 'firing' or ('not firing: ' .. tostring(err) .. ' (refunded)') })
+			end)
 			return nil
 		end, nil, timer.getTime() + 30)
 		timer.scheduleFunction(function() destroyGroup(gun) O.teams[gun] = nil end, nil,
@@ -570,7 +634,12 @@ local function flightTick()
 		elseif f.kind ~= 'jam' then
 			local p = lead:getPoint()
 			local airborne = lead:inAir()
-			if f.phase == 'outbound' and not airborne and dist2(p, { x = f.lz.x, z = f.lz.z }) < 1000 then
+			if f.phase == 'outbound' and not airborne and dist2(p, f.home) < 3000 and now() - f.at > 180 then
+				-- landed back home without ever landing at the site
+				destroyGroup(name)
+				X.refund(RED, f.price, f.kind .. ' could not land at its landing site')
+				endFlight(f, 'could not land at the landing site (refunded)')
+			elseif f.phase == 'outbound' and not airborne and dist2(p, { x = f.lz.x, z = f.lz.z }) < 1500 then
 				local ok, result = pcall(onLanded, f, lead)
 				f.result = ok and result or ('error: ' .. tostring(result))
 				f.phase = 'returning'
@@ -620,6 +689,7 @@ function O.heliRaid(side, order)
 	local f, ferr = startHeloFlight('heli_raid', origin, { x = lz.x, z = lz.y },
 		{ target = target.zone, gunTemplate = gun.template, gun = gunName })
 	if not f then return false, ferr end
+	f.price = price
 	X.charge(side, price, string.format('heli raid %s -> %s', origin.zone, target.zone))
 	return true, string.format('%s carries a %s from %s to %d km from %s (cost %d)', f.group, gunName, origin.zone,
 		round(gun.rangeKm * 0.8), target.zone, price)
@@ -639,6 +709,7 @@ function O.airAssault(side, order)
 	if not lz then return false, 'no landing site in ' .. target.zone end
 	local f, ferr = startHeloFlight('air_assault', origin, { x = lz.x, z = lz.y }, { target = target.zone, holdSec = 60 })
 	if not f then return false, ferr end
+	f.price = price
 	X.charge(side, price, string.format('air assault %s -> %s', origin.zone, target.zone))
 	return true, string.format('%s flies troops from %s to capture %s (cost %d)', f.group, origin.zone, target.zone, price)
 end
@@ -652,6 +723,7 @@ function O.ambush(side, order)
 	local b = U.bcObj()
 	local from, to = b:getZoneByName(order.fromZone or ''), b:getZoneByName(order.towardZone or '')
 	if not (from and to and from.active and to.active) then return false, 'fromZone and towardZone must be known zones' end
+	pruneTeams()
 	local active = 0
 	for _, t in pairs(O.teams) do if t.kind == 'ambush' then active = active + 1 end end
 	for _, f in pairs(O.flights) do if f.kind == 'ambush' then active = active + 1 end end
@@ -666,6 +738,7 @@ function O.ambush(side, order)
 	local f, ferr = startHeloFlight('ambush', origin, { x = lz.x, z = lz.y },
 		{ target = string.format('%s-%s', from.zone, to.zone), teamTemplate = teamTemplate, team = order.team or 'manpads', holdSec = 60 })
 	if not f then return false, ferr end
+	f.price = price
 	X.charge(side, price, string.format('ambush team between %s and %s', from.zone, to.zone))
 	return true, string.format('%s drops a %s team %d%% of the way from %s to %s (cost %d)', f.group, order.team or 'manpads',
 		round(frac * 100), from.zone, to.zone, price)
@@ -695,10 +768,19 @@ local function isRadar(unit)
 	return (ok1 and sr) or (ok2 and tr)
 end
 
--- Sends an airborne jammer to orbit standoffNm from the zone, on its own side.
+-- Jamming range against one radar: long-range systems are jammed from beyond
+-- the distance at which they could shoot the jammer down.
+function O.jamRangeNm(unit)
+	local okT, typeName = pcall(unit.getTypeName, unit)
+	local t = okT and tostring(typeName):lower() or ''
+	for _, rule in ipairs(jcfg.rangeNmByRadar or {}) do
+		if t:find(rule[1]) then return rule[2] end
+	end
+	return jcfg.rangeNm
+end
+
+-- Sends a jammer Claude launched to orbit standoffNm from the zone, on its own side.
 local function routeJammer(gr, zn)
-	local cat = gr:getCategory()
-	if cat ~= Group.Category.AIRPLANE and cat ~= Group.Category.HELICOPTER then return end
 	local lead = gr:getUnit(1)
 	local zp = zonePoint(zn)
 	if not (lead and zp) then return end
@@ -714,27 +796,34 @@ local function routeJammer(gr, zn)
 	} } } })
 end
 
-local function jamTick(groupname, zonename)
-	local state = O.jams[groupname]
-	if not state then return false end
+local function jamTick(groupname, zonename, state)
+	if O.jams[groupname] ~= state then
+		-- a newer jamRadarsAtZone call for this group took over; release what this one jammed
+		for name in pairs(state.jammed) do
+			local u = Unit and Unit.getByName and Unit.getByName(name)
+			if u and u:isExist() then setJammed(u, false) end
+		end
+		return false
+	end
 	local b = U.bcObj()
 	local gr = Group.getByName(groupname)
 	local zn = b:getZoneByName(zonename)
-	local active = gr ~= nil and gr:isExist() and gr:getSize() > 0 and zn ~= nil and zn.side ~= state.side
+	local active = not state.ended and gr ~= nil and gr:isExist() and gr:getSize() > 0 and zn ~= nil and zn.side ~= state.side
 	if active and Utils and Utils.isGroupActive then active = Utils.isGroupActive(gr) end
+	if active and state.own then wake(zn) end   -- keep the target's radars spawned while Claude's jammer works
 	local jammers = {}
 	if active then
 		for _, u in ipairs(gr:getUnits() or {}) do
 			if u:isExist() then jammers[#jammers + 1] = u:getPoint() end
 		end
 	end
-	local range = jcfg.rangeNm * NM
 	local seen = {}
 	for _, v in pairs(zn and zn.built or {}) do
 		local g = Group.getByName(v)
 		for _, u in ipairs(g and g:getUnits() or {}) do
 			if u:isExist() and isRadar(u) then
 				local name = u:getName()
+				local range = O.jamRangeNm(u) * NM
 				local inRange = false
 				for _, jp in ipairs(jammers) do
 					if dist2(jp, u:getPoint()) <= range then inRange = true break end
@@ -754,12 +843,16 @@ local function jamTick(groupname, zonename)
 		if not seen[name] then state.jammed[name] = nil end
 	end
 	if not active then
-		O.jams[groupname] = nil
+		if O.jams[groupname] == state then O.jams[groupname] = nil end
 		return false
 	end
 	return true
 end
 
+-- Replaces Foothold's jamRadarsAtZone for both sides: same checks and messages,
+-- but only radars within range of a live jammer are jammed. Jammers Claude
+-- launched are routed to a standoff orbit; others (BLUE's shop jammer) keep their
+-- Mission Editor route and lifetime.
 U.wrap(BattleCommander, 'BattleCommander', 'jamRadarsAtZone', function(original, self, groupname, zonename)
 	local gr = Group.getByName(groupname)
 	local zn = self:getZoneByName(zonename)
@@ -770,10 +863,12 @@ U.wrap(BattleCommander, 'BattleCommander', 'jamRadarsAtZone', function(original,
 	end
 	if not gr then return 'EW group dead' end
 	if zn.side == gr:getCoalition() then return 'Can not jam friendly zone' end
-	if jcfg.routeJammers ~= false then pcall(routeJammer, gr, zn) end
-	O.jams[groupname] = { zone = zonename, side = gr:getCoalition(), jammed = {} }
+	local own = O.ownJammers[groupname] == true
+	if own and jcfg.routeJammers ~= false then pcall(routeJammer, gr, zn) end
+	local state = { zone = zonename, side = gr:getCoalition(), jammed = {}, own = own }
+	O.jams[groupname] = state
 	timer.scheduleFunction(function(_, t)
-		local ok, again = pcall(jamTick, groupname, zonename)
+		local ok, again = pcall(jamTick, groupname, zonename, state)
 		if not ok then FAI.warn('ops', 'jamming tick failed: %s', tostring(again)) return nil end
 		return again and t + 10 or nil
 	end, nil, timer.getTime() + 10)
@@ -781,6 +876,11 @@ end)
 
 function O.jammerTemplate()
 	return firstTemplate(jcfg.templates and jcfg.templates.red)
+end
+
+local function stopJamming(name)
+	local state = O.jams[name]
+	if state then state.ended = true end   -- the next tick restores every radar it jammed
 end
 
 function O.jam(side, order)
@@ -813,19 +913,32 @@ function O.jam(side, order)
 	local spawned, err = spawnFlight(template, name, op, alt, 200, { waypoint(op, alt, 200, nil, 'BARO'),
 		waypoint(toward(tp, op, jcfg.standoffNm * NM), alt, 200, nil, 'BARO') }, 1)
 	if not spawned then return false, err end
-	local jamErr = b:jamRadarsAtZone(name, target.zone)
-	if jamErr then
+	O.ownJammers[name] = true
+	local f = { kind = 'jam', group = name, origin = origin.zone, target = target.zone, price = price,
+		home = { x = op.x, z = op.z }, phase = 'transit', at = now(), timeoutSec = jcfg.durationSec + 2400 }
+	O.flights[name] = f
+	X.charge(side, price, 'jammer over ' .. target.zone)
+	local function fail(why)
 		destroyGroup(name)
-		return false, 'jamming refused: ' .. tostring(jamErr)
+		X.refund(side, price, 'jammer: ' .. why)
+		if O.flights[name] == f then endFlight(f, why .. ' (refunded)') end
 	end
-	O.flights[name] = { kind = 'jam', group = name, origin = origin.zone, target = target.zone,
-		home = { x = op.x, z = op.z }, phase = 'jamming', at = now(), timeoutSec = jcfg.durationSec + 2400 }
+	-- The jamming starts once the target zone is awake (its radars exist).
+	whenAwake(target, function(isAwake)
+		if O.flights[name] ~= f then return end
+		if not isAwake then fail('target zone did not wake up') return end
+		local jamErr = b:jamRadarsAtZone(name, target.zone)
+		if jamErr or not groupAlive(name) or not O.jams[name] then
+			fail('jamming refused: ' .. tostring(jamErr or 'jammer removed'))
+			return
+		end
+		f.phase = 'jamming'
+	end)
 	timer.scheduleFunction(function()
-		local f = O.flights[name]
 		local g = Group.getByName(name)
-		if not (f and g and g:isExist()) then return nil end
+		if O.flights[name] ~= f or not (g and g:isExist()) then return nil end
 		f.phase = 'returning'
-		O.jams[name] = nil
+		stopJamming(name)
 		local lead = leadUnit(name)
 		if lead then
 			g:getController():setTask({ id = 'Mission', params = { airborne = true, route = { points = {
@@ -833,9 +946,8 @@ function O.jam(side, order)
 		end
 		return nil
 	end, nil, timer.getTime() + jcfg.durationSec)
-	X.charge(side, price, 'jammer over ' .. target.zone)
-	return true, string.format('%s from %s jams %s radars within %d nm for %d min (cost %d)', name, origin.zone,
-		target.zone, jcfg.rangeNm, round(jcfg.durationSec / 60), price)
+	return true, string.format('%s from %s jams %s SAM radars in range for %d min (cost %d)', name, origin.zone,
+		target.zone, round(jcfg.durationSec / 60), price)
 end
 
 ---------------------------------------------------------------------------
@@ -855,6 +967,7 @@ E.jam = O.jam
 
 local function operationsRow(b)
 	pruneDeployed()
+	pruneTeams()
 	local catPrices = {}
 	for cat in pairs(prices.deploy) do catPrices[cat] = O.deployPrice(cat) end
 	local catalog = {}
@@ -867,10 +980,16 @@ local function operationsRow(b)
 	local okC, choices = pcall(b._redZoneUpgradeChoices, b, false)
 	for _, c in ipairs(okC and choices or {}) do
 		local pools = {}
+		local slotPrices = {}
 		for cat, list in pairs(upgradePools(c.zone)) do
-			if type(list) == 'table' and #list > 0 then pools[cat] = FAI.json.array(list) end
+			if type(list) == 'table' and #list > 0 then
+				pools[cat] = FAI.json.array(list)
+				for _, name in ipairs(list) do
+					slotPrices[name] = O.deployPrice(cat == 'sam' and categoryOf(name) or cat)
+				end
+			end
 		end
-		if next(pools) then slots[#slots + 1] = { zone = c.zone.zone, templates = pools } end
+		if next(pools) then slots[#slots + 1] = { zone = c.zone.zone, templates = pools, prices = slotPrices } end
 	end
 	local systems = {}
 	for name, s in pairs(ops.fireSystems) do
@@ -909,6 +1028,8 @@ local function operationsRow(b)
 	end
 	table.sort(teamsAvail)
 	local jammer = O.jammerTemplate()
+	local longRange = jcfg.rangeNm
+	for _, r in ipairs(jcfg.rangeNmByRadar or {}) do longRange = math.max(longRange, r[2]) end
 	return {
 		prices = { deploy = catPrices, airlift = priceOf(prices.airlift), heli_raid = priceOf(prices.heli_raid),
 			air_assault = priceOf(prices.air_assault), ambush = priceOf(prices.ambush), jam = priceOf(prices.jam),
@@ -925,11 +1046,14 @@ local function operationsRow(b)
 		ambushTeams = FAI.json.array(teamsAvail),
 		flights = FAI.json.array(flights),
 		groundTeams = FAI.json.array(teams),
-		jammer = jammer and { template = jammer, rangeNm = jcfg.rangeNm, minutes = round(jcfg.durationSec / 60) }
+		jammer = jammer and { template = jammer, rangeNm = jcfg.rangeNm, longRangeSamRangeNm = longRange,
+			minutes = round(jcfg.durationSec / 60) }
 			or { unavailable = 'no RED jammer aircraft in this mission' },
 		awacs = { station = O.awacsStation and O.awacsStation.zone or nil,
 			available = (_awacsFG and _awacsFG[RED] and true) or false },
 		airliftUnits = ops.airliftUnits,
+		limits = { activeFlights = ops.maxActiveFlights, ambushTeams = ops.ambushMaxActive },
+		awacsReadyInMin = math.max(0, math.ceil(((O.awacsReadyAt or 0) - now()) / 60)),
 	}
 end
 
@@ -942,6 +1066,12 @@ timer.scheduleFunction(function(_, t)
 	if not ok then FAI.warn('ops', 'flight tick failed: %s', tostring(err)) end
 	return t + 5
 end, nil, timer.getTime() + 5)
+
+timer.scheduleFunction(function(_, t)
+	local ok, err = pcall(function() pruneDeployed() pruneTeams() end)
+	if not ok then FAI.warn('ops', 'prune failed: %s', tostring(err)) end
+	return t + 60
+end, nil, timer.getTime() + 60)
 
 local okR, errR = pcall(restoreDeployed)
 if not okR then FAI.warn('ops', 'restoring deployed groups failed: %s', tostring(errR)) end

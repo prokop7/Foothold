@@ -40,6 +40,8 @@ ORDERS_SCHEMA = "footholdai.orders.v1"
 SIDES = ("red", "blue")
 STATE_KINDS = ("ping", "command")
 ASYNC_KINDS = {"command"}  # long Claude cycles run in the worker pool
+STALE_STATE_SEC = 120      # at start-up, older command states were answered or abandoned
+LINK_TEST_REUSE_SEC = 300  # one Claude link test serves both sides for this long
 
 log = logging.getLogger("footholdai")
 
@@ -116,12 +118,58 @@ def to_lua(value, indent: int = 0) -> str:
     raise ValueError(f"unsupported value type: {type(value).__name__}")
 
 
-def write_orders(exchange: pathlib.Path, side: str, orders: dict) -> None:
+def write_orders(exchange: pathlib.Path, side: str, orders: dict, retry_sec: float = 5.0) -> None:
     kind = orders["kind"]
     path = exchange / f"orders_{side}_{kind}.lua"
     tmp = exchange / f"orders_{side}_{kind}.lua.tmp"
     tmp.write_text("return " + to_lua(orders) + "\n", encoding="utf-8")
-    os.replace(tmp, path)
+    # On Windows the replace fails while DCS (or a virus scanner) has a file open; retry briefly.
+    deadline = time.monotonic() + retry_sec
+    delay = 0.1
+    while True:
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(delay)
+            delay = min(delay * 2, 1.0)
+
+
+def run_process(args: list[str], prompt: str, timeout: float, cwd: pathlib.Path) -> subprocess.CompletedProcess:
+    """Run a command with stdin text; on timeout kill the whole process tree (claude.cmd starts node)."""
+    kwargs = {}
+    if os.name == "nt":
+        kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        kwargs["start_new_session"] = True
+    proc = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True, encoding="utf-8", errors="replace", cwd=cwd, **kwargs)
+    try:
+        out, err = proc.communicate(prompt, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        kill_tree(proc)
+        try:
+            proc.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            pass
+        raise TimeoutError(f"claude did not finish within {int(timeout)} s and was stopped")
+    return subprocess.CompletedProcess(args, proc.returncode, out, err)
+
+
+def kill_tree(proc: subprocess.Popen) -> None:
+    try:
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)], capture_output=True, timeout=15)
+        else:
+            os.killpg(proc.pid, 9)
+    except Exception:  # already gone
+        pass
+    try:
+        proc.kill()
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -159,10 +207,7 @@ class ClaudeCli:
         if system_prompt_file:
             args += ["--system-prompt-file", str(system_prompt_file)]
         started = time.monotonic()
-        proc = subprocess.run(
-            args, input=prompt, capture_output=True, text=True, encoding="utf-8",
-            timeout=self.timeout, cwd=self.workdir,
-        )
+        proc = run_process(args, prompt, self.timeout, self.workdir)
         latency_ms = int((time.monotonic() - started) * 1000)
         if proc.returncode != 0:
             raise RuntimeError(f"claude exited {proc.returncode}: {proc.stderr.strip()[:500]}")
@@ -196,8 +241,7 @@ class ClaudeCli:
             "--permission-mode", "dontAsk",
             "--system-prompt-file", str(system_prompt_file),
         ]
-        proc = subprocess.run(args, input=prompt, capture_output=True, text=True, encoding="utf-8",
-                              timeout=timeout, cwd=self.workdir)
+        proc = run_process(args, prompt, timeout, self.workdir)
         if proc.returncode != 0:
             raise RuntimeError(f"claude exited {proc.returncode}: {proc.stderr.strip()[:500]}")
         try:
@@ -235,8 +279,12 @@ class Bridge:
         self.last_seq: dict[tuple, tuple] = {}
         self.order_seq = 0
         self.seq_lock = threading.Lock()
-        self.pool = ThreadPoolExecutor(max_workers=2)  # one Claude call per side at a time
+        self.pool = ThreadPoolExecutor(max_workers=3)  # one cycle per side, plus a link test
         self.busy: set[str] = set()
+        self.started_at = time.time()
+        self.link_result: dict | None = None
+        self.link_result_at = 0.0
+        self.link_running = False
 
     def next_order_seq(self) -> int:
         # Millisecond clock keeps seq increasing across sidecar restarts.
@@ -254,11 +302,17 @@ class Bridge:
         stamp = (stat.st_mtime_ns, stat.st_size)
         if self.last_stamp.get(key) == stamp:
             return None
+        first_sight = key not in self.last_stamp
         try:
-            state = json.loads(path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, UnicodeDecodeError, OSError):
+            # errors="replace": a string the mission cut mid-character must not stall this side
+            state = json.loads(path.read_bytes().decode("utf-8", errors="replace"))
+        except (json.JSONDecodeError, OSError):
             return None  # mission is mid-write; retry on the next poll
         self.last_stamp[key] = stamp
+        if first_sight and kind in ASYNC_KINDS and stat.st_mtime < self.started_at - STALE_STATE_SEC:
+            self.last_seq[key] = (state.get("session"), state.get("seq"))
+            log.info("%s: skipping %s seq=%s from before the sidecar started", side, path.name, state.get("seq"))
+            return None
         if state.get("schema") != STATE_SCHEMA or state.get("side") != side or state.get("kind") != kind:
             log.warning("ignoring %s: unexpected schema/side/kind", path.name)
             return None
@@ -288,15 +342,27 @@ class Bridge:
         log.info("%s: wrote orders kind=%s ackSeq=%s", side, orders.get("kind"), state.get("seq"))
 
     def on_ping(self, side: str, state: dict) -> dict:
+        """Answers at once. A requested Claude link test runs in the pool; its result is
+        reported with the next ping (the mission pings every minute until it sees it)."""
         claude_info = {"called": False}
         if (state.get("payload") or {}).get("wantsClaude") and self.claude:
-            try:
-                claude_info = claude_link_test(self.claude)
-                log.info("%s: Claude link test ok in %d ms", side, claude_info["latencyMs"])
-            except Exception as exc:  # report the failure to the mission instead of dying
-                claude_info = {"called": True, "ok": False, "error": str(exc)[:300]}
-                log.error("%s: Claude link test failed: %s", side, exc)
+            fresh = self.link_result and time.monotonic() - self.link_result_at < LINK_TEST_REUSE_SEC
+            if fresh:
+                claude_info = self.link_result
+            elif not self.link_running:
+                self.link_running = True
+                self.pool.submit(self._link_test)
         return {"kind": "pong", "claude": claude_info}
+
+    def _link_test(self) -> None:
+        try:
+            result = claude_link_test(self.claude)
+            log.info("Claude link test ok in %d ms", result["latencyMs"])
+        except Exception as exc:  # report the failure to the mission instead of dying
+            result = {"called": True, "ok": False, "error": str(exc)[:300]}
+            log.error("Claude link test failed: %s", exc)
+        self.link_result, self.link_result_at = result, time.monotonic()
+        self.link_running = False
 
     def on_command(self, side: str, state: dict) -> dict | None:
         if not self.claude:

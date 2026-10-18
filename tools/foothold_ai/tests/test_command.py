@@ -48,11 +48,15 @@ class CommandLuaTest(unittest.TestCase):
     def calls(self, name):
         return [c for c in self.fs.calls.values() if c.name == name]
 
-    def send_orders(self, side, orders):
+    def send_orders(self, side, orders, ack=None):
+        """Answers the snapshot the mission waits for (or pretends one was sent)."""
         self.seq += 1
+        if ack is None:
+            ack = self.x.awaiting[side] or 900 + self.seq
+            self.x.awaiting[side] = ack
         sidecar.write_orders(self.exchange, side, {
             "schema": sidecar.ORDERS_SCHEMA, "side": side, "seq": self.seq, "session": self.session,
-            "kind": "command", "cycle": 1, "summary": "test", "orders": orders})
+            "kind": "command", "cycle": 1, "summary": "test", "orders": orders, "ackSeq": ack})
         self.h.advance(5)
 
     def results(self, side):
@@ -99,8 +103,8 @@ class CommandLuaTest(unittest.TestCase):
         self.assertEqual([o["zone"] for o in red["freeform"]["airOrigins"]], ["Red Base"])
         self.assertIn("upgrade", [i["item"] for i in red["purchases"]["items"]])
         self.assertNotIn("Red Full", red["purchases"]["upgradeZones"])
-        self.assertEqual(red["scriptedEvents"], [{"event": "scuds", "available": True},
-                                                  {"event": "helohunt", "available": False}])
+        self.assertEqual(red["scriptedEvents"], [{"event": "scuds", "available": True, "price": 1000},
+                                                  {"event": "helohunt", "available": False, "price": 1000}])
         self.assertEqual(red["detectedEnemyAir"][0]["nearZone"], "Red Front")
         self.assertEqual(red["economy"]["credits"], 5000)
         blue = self.snapshot("blue")
@@ -370,8 +374,10 @@ class McpToolsTest(unittest.TestCase):
     def test_freeform_credit_budget(self):
         self.t.launch_mission("Red Base", "CAS", "Blue Front")
         self.t.launch_mission("Red Base", "SEAD", "Blue Front")
-        with self.assertRaisesRegex(ValueError, "not enough credits"):
+        with self.assertRaisesRegex(ValueError, "already flying or ordered"):
             self.t.launch_mission("Red Base", "SEAD", "Blue Front")
+        with self.assertRaisesRegex(ValueError, "not enough credits"):
+            self.t.launch_mission("Red Base", "SEAD", "Red Front")
         with self.assertRaisesRegex(ValueError, "cannot launch aircraft"):
             self.t.launch_mission("Red Front", "CAS", "Blue Front")
 

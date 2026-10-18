@@ -126,6 +126,10 @@ function STUB.makeGroup(name, category, side, unitDefs)
 end
 
 Group.getByName = function(name) return STUB.groups[name] end
+Unit = { getByName = function(name)
+	local u = STUB.units[name]
+	return (u and u.alive) and u or nil
+end }
 
 coalition.getPlayers = function(side)
 	local out = {}

@@ -1,6 +1,6 @@
 # Credits: how RED (and BLUE) pay for what Claude orders
 
-Goal: RED has an economy like BLUE's player team. It earns credits by holding ground and by fighting, and Claude decides how to spend them. Nothing extra is free, so a Scud costs as much as a BLUE cruise-missile strike, and a lost helicopter loses its credits.
+Goal: RED has an economy like BLUE's player team. It earns credits by holding ground and by fighting, and Claude decides how to spend them. Nothing extra is free, so a Scud costs as much as a BLUE cruise-missile strike, and a lost helicopter loses its credits. Only Foothold's pre-built capabilities are free by default (see below).
 
 All numbers are settings (`FootholdAI_Config.lua` → `command = { economy = ..., prices = ..., ops = ... }`) and are meant to be tuned after play-testing.
 
@@ -33,7 +33,7 @@ Prices come from the BLUE shop item that matches each order (`ShopPrices` in Foo
 
 | Order | Price key | PG price |
 |---|---|---|
-| Free-form missions (CAP/sweep, CAS, SEAD, runway strike, convoy, artillery) | `dynamiccap` / `dynamiccas` / `dynamicsead` / `dynamicbomb` / `groundattack` | 500–1000 |
+| Free-form missions (CAP/sweep, CAS, SEAD, runway strike, convoy, artillery), **every launch**, including launching the same mission again later | `dynamiccap` / `dynamiccas` / `dynamicsead` / `dynamicbomb` / `groundattack` | 500–1000 |
 | RED purchases (upgrade, depot, repair, mass attack, bomber) | Foothold's RED shop items | as configured by Foothold |
 | `deploy_forces` / `upgrade_zone` by category | infantry/ground `zinf`, armor `zarm`, AAA `zvulcan`, SHORAD `zavenger`, SAM `zhawk`, long-range SAM (SA-10 etc.) `zpat`, artillery `zhimars` | 500–5000 |
 | `fire_mission` Scud / Iskander | `cruisemsl` | 800 per fire mission |
@@ -44,6 +44,7 @@ Prices come from the BLUE shop item that matches each order (`ShopPrices` in Foo
 | `jam` | `jam` | 500 |
 | `supply_airlift` (3 units) | `zsup3` | 750 |
 | `move_awacs` | 0 (10 min cooldown) | 0 |
+| `trigger_event` (the mission's scripted RED events, e.g. the Scud event) | `prices.event` (or per event in `prices.events`), 60 min cooldown per event | 1000 |
 | Foothold's pre-built capabilities | `economy.capabilityFee` × the role's price | **0 by default** |
 
 **Pre-built capabilities stay free by default.** That is how Foothold works for both sides: the map's own AI flights cost aircraft and warehouse stock, not credits, and BLUE's AI support is free in the same way. Credits buy the extras, as they do for players. If RED launches too much, set `capabilityFee = { red = 0.25 }` (a quarter of the shop price per sortie).
@@ -54,7 +55,12 @@ Besides credits, the expensive orders have limits:
 - one upgrade slot per zone, as in Foothold;
 - 4 ambush teams at once;
 - one jammer at a time;
-- 6 helicopter and jammer operations at once.
+- 6 helicopter and jammer operations at once;
+- a mass attack, then 60 minutes before the next.
+
+**Refunds.** Credits come back when an order never happened through no fault of the side: Foothold denied the launch (a BLUE player at the origin, a blocked runway), the group never spawned or never launched, a fire mission or raid gun was refused by Foothold (e.g. no targets in the zone), a helicopter could not land at its site, or the target zone never woke up. They are **not** refunded when the enemy destroyed the flight, battery or gun: that loss is the price of the attempt. Refunds show in the ledger as `refund: ...`.
+
+**Sleeping zones.** Foothold suspends zones nobody is near. Like BLUE's shop, a RED fire mission, raid or jammer wakes its target zone first and waits for its units to appear before it fires or jams.
 
 ## 4. What Claude sees and does
 
@@ -69,9 +75,10 @@ Every order tool checks the price against the credits left this cycle and refuse
 
 ## 5. Jamming, fair for both sides
 Foothold's `jamRadarsAtZone` (BLUE's shop jammer) silenced every SAM radar of a zone, however far away the jammer was. It is now replaced for **both** sides:
-- only SAM search and track radars within `jamming.rangeNm` (40 nm) of a live jammer unit are set to weapons hold;
-- a radar that falls out of range, or whose jammer dies, is restored at once;
-- the jammer is sent to orbit `standoffNm` (25 nm) from the zone, on its own side, so it can be found and shot down. This includes BLUE's `ewAircraft`, which used to fly its fixed Mission Editor route;
+- only SAM search and track radars within range of a live jammer unit are set to weapons hold. The range is `jamming.rangeNm` (40 nm), and more for long-range SAM radars so the jammer works from outside their reach: Patriot 60 nm, S-300 65 nm, S-200 140 nm (`jamming.rangeNmByRadar`, matched on the radar's unit type);
+- a radar that falls out of range, or whose jammer dies or leaves, is restored within 10 seconds;
+- RED's jammer flies to an orbit `standoffNm` (25 nm) from the zone, on its own side, so it can be found and shot down, and goes home after 30 minutes;
+- BLUE's shop jammer (`ewAircraft`) keeps its Mission Editor route and lifetime (a 60-minute orbit, then it leaves). Where that orbit is decides which RED zones it can reach; move its orbit in the Mission Editor if it is too far from the front;
 - player-bought SAMs (zone upgrades from the shop) are zone defenders, so they are jammed under the same rule as anything else.
 
 ### Adding a dedicated RED jammer (optional)

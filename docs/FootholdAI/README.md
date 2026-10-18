@@ -138,7 +138,9 @@ Re-patch the mission (a new file, `Foothold_AI_Ops.lua`, is added to the trigger
 - [ ] `air_assault`: a Mi-8 lands troops in a neutral zone and the capture countdown starts.
 - [ ] `ambush`: a Mi-8 drops an Igla or ZU-23 team between two zones.
 - [ ] `jam`: the jammer flies to an orbit about 25 nm from the BLUE zone. Only radars within 40 nm stop firing; shooting it down restores them within 10 s.
-- [ ] BLUE shop jammer (if your mission sells it): the jammer now flies toward the target zone, and only jams within 40 nm.
+- [ ] BLUE shop jammer (if your mission sells it): it flies its Mission Editor route as before, but only jams radars within range of it.
+- [ ] A delayed order Claude cancels (`cancel_orders`) does not run.
+- [ ] Refunds: a launch Foothold denies (e.g. while you sit at the RED origin) gives the credits back (`refund:` in the ledger).
 - [ ] `move_awacs`: the RED AWACS moves and stays there after zone captures.
 
 **Send back** the same files as batch 2, plus `ops_*.lua` from the exchange folder.
@@ -147,6 +149,9 @@ Re-patch the mission (a new file, `Foothold_AI_Ops.lua`, is added to the trigger
 - Menu text is English only. Foothold's localization will be added once the feature set settles.
 - Wingmen carry the slot's default loadout from the Mission Editor, not what you rearmed to.
 - Dismiss removes the aircraft instantly.
+
+## Restarting the sidecar
+If you restart `sidecar.py` while the mission runs, it skips a planning request older than 2 minutes (it was answered already, or the mission will ask again). The mission ignores any answer to a request it is no longer waiting for, so a restart never doubles orders. If a cycle was cut off, the mission asks again after `requestTimeoutSec` (15 min).
 
 ## Known limitations (batch 3)
 - Fire-mission and raid-gun ranges are estimates (Scud 280 km, Iskander 450 km, Smerch 65 km, 2S9 Nona 8 km, 2S3 Akatsia 17 km); tune them in `command.ops` after testing.
@@ -157,7 +162,7 @@ Re-patch the mission (a new file, `Foothold_AI_Ops.lua`, is added to the trigger
 
 ## Known limitations (batch 2)
 - Claude sets timing with launch delays. Foothold flights have no shared push point yet (phase 4), so arrival times can drift with start-up and taxi.
-- Group size and loadout come from the mission's templates; Claude chooses what, where and when, not the airframes.
+- Group size and loadout come from the mission's templates. Free-form missions can name one exact template; pre-built capabilities use what the map defines.
 - RED sees BLUE aircraft only through its radars (Foothold's EWRS registry); BLUE FARPs and ground units are not reported yet.
 - If the sidecar stops, nothing on the Claude sides acts (no fallback, by design) until it is running again.
 - Player strike missions from Foothold's event scheduler (e.g. the warehouse and port strikes) are still chosen by Foothold.

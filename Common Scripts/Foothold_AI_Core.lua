@@ -101,17 +101,21 @@ FAI.defaults = {
 			ambush = 'zvulcan',
 			jam = 'jam',
 			awacs = 0,
+			event = 1000,               -- trigger_event (scripted RED events); per event: events = { scuds = 1500 }
+			events = {},
 		},
+		eventCooldownSec = 3600,        -- per scripted event
+		massAttackCooldownSec = 3600,
 		ops = {
 			deployMaxPerZone = 2,       -- extra groups placed by deploy_forces, per zone
 			deployMaxTotal = 12,
 			-- Long-range fire: a battery is set up inside a RED zone, fires, and stays there
 			-- (a real target) for lifetimeSec. range in km; eras = Foothold Era values (nil = all).
 			fireSystems = {
-				scud = { templates = { 'Scuds' }, rangeKm = 280, salvo = 1, price = 'cruisemsl', cooldownSec = 1800, lifetimeSec = 1200 },
-				iskander = { templates = { 'Khasab-Forces-attack' }, rangeKm = 450, salvo = 4, price = 'cruisemsl',
+				scud = { templates = { 'Scuds' }, rangeKm = 280, minKm = 50, salvo = 1, price = 'cruisemsl', cooldownSec = 1800, lifetimeSec = 1200 },
+				iskander = { templates = { 'Khasab-Forces-attack' }, rangeKm = 450, minKm = 50, salvo = 4, price = 'cruisemsl',
 					cooldownSec = 1800, lifetimeSec = 1200, eras = { Modern = true } },
-				smerch = { templates = { 'qeshm-arty-Attack-Group' }, rangeKm = 65, salvo = 12, price = 'zhimars',
+				smerch = { templates = { 'qeshm-arty-Attack-Group' }, rangeKm = 65, minKm = 20, salvo = 12, price = 'zhimars',
 					cooldownSec = 1200, lifetimeSec = 1200, eras = { Modern = true, Coldwar = true } },
 			},
 			fireSetupSec = 60,          -- from setting up to firing
@@ -125,12 +129,16 @@ FAI.defaults = {
 			ambushMaxActive = 4,
 			helo = { altitudeM = 150, speedKmh = 220, cruiseMaxKm = 150, timeoutSec = 2400 },
 			airliftUnits = 3,
-			-- Jamming, both sides: only SAM radars within rangeNm of a live jammer are jammed,
-			-- and the jammer is sent to orbit standoffNm from the target zone.
+			-- Jamming, both sides: only SAM radars within range of a live jammer are jammed
+			-- (rangeNm, or more for long-range SAM radars, matched on the unit type, so the
+			-- jammer works from outside their reach). Claude's jammer orbits standoffNm from
+			-- the target; BLUE's shop jammer keeps its Mission Editor route and lifetime.
 			-- RED jammer: the first template found. Add a late-activated RED group named
 			-- ewAircraftRed in the Mission Editor for a dedicated jammer; AN-30M stands in until then.
 			jamming = { rangeNm = 40, standoffNm = 25, durationSec = 1800, altitudeFt = 22000,
-				routeJammers = true, templates = { red = { 'ewAircraftRed', 'AN-30M' } } },
+				routeJammers = true, templates = { red = { 'ewAircraftRed', 'AN-30M' } },
+				rangeNmByRadar = { { 'patriot', 60 }, { 's%-300', 65 }, { '40b6', 65 }, { '64h6', 65 },
+					{ '5n62', 140 }, { '19j6', 140 }, { 's%-200', 140 } } },
 			maxActiveFlights = 6,       -- RED helicopter/jammer operations at once
 		},
 	},
@@ -192,7 +200,13 @@ local function loadDataFile(path)
 	if not (lfs and lfs.attributes(path)) then return nil end
 	local size = lfs.attributes(path, 'size') or 0
 	if size <= 0 or size > 1024 * 1024 then return nil, 'bad size ' .. tostring(size) end
-	local chunk, err = loadfile(path)
+	local f, ferr = io.open(path, 'rb')
+	if not f then return nil, ferr end
+	local text = f:read('*a')
+	f:close()
+	-- Precompiled chunks can escape the empty environment; data files are text only.
+	if not text or text:sub(1, 1) == '\27' then return nil, 'not a text data file' end
+	local chunk, err = loadstring(text, '=' .. path)
 	if not chunk then return nil, err end
 	setfenv(chunk, {})
 	local ok, result = pcall(chunk)
@@ -334,7 +348,7 @@ end
 FAI.bridge = {
 	seq = { red = 0, blue = 0 },
 	lastOrderSeq = {},   -- [side:kind] = seq
-	lastOrderStamp = {}, -- [side:kind] = mtime:size
+	badOrderStamp = {},  -- [side:kind] = mtime:size of a file that was rejected
 	handlers = {},
 	pendingPings = {},
 	linkOk = { red = false, blue = false },
@@ -382,16 +396,20 @@ local function readOrders(side, kind)
 	local path = FAI.dir .. 'orders_' .. side .. '_' .. kind .. '.lua'
 	local attr = lfs.attributes(path)
 	if not attr then return end
+	-- Read every poll and decide by seq: file times have 1 s resolution, so two
+	-- answers written within a second could look identical. Only a rejected
+	-- file is skipped until it changes, so it is not reported every poll.
 	local stamp = tostring(attr.modification) .. ':' .. tostring(attr.size)
-	if stamp == bridge.lastOrderStamp[key] then return end
-	bridge.lastOrderStamp[key] = stamp
+	if stamp == bridge.badOrderStamp[key] then return end
 	local orders, err = loadDataFile(path)
 	if not orders then
+		bridge.badOrderStamp[key] = stamp
 		FAI.warn('bridge', 'rejected %s: %s', path, tostring(err))
 		return
 	end
 	if orders.schema ~= 'footholdai.orders.v1' or orders.side ~= side or orders.kind ~= kind
 		or type(orders.seq) ~= 'number' then
+		bridge.badOrderStamp[key] = stamp
 		FAI.warn('bridge', 'rejected %s: bad header', path)
 		return
 	end
@@ -416,6 +434,10 @@ end
 
 -- Link test: the first ping per side asks the sidecar to call Claude once.
 function bridge.ping()
+	local now = timer.getTime()
+	for key, sentAt in pairs(bridge.pendingPings) do
+		if now - sentAt > 600 then bridge.pendingPings[key] = nil end
+	end
 	for _, side in ipairs(FAI.config.bridge.sides) do
 		local wantsClaude = not bridge.linkOk[side]
 		local seq = bridge.writeState(side, 'ping', { wantsClaude = wantsClaude })
@@ -425,6 +447,7 @@ end
 
 bridge.onOrders('pong', function(side, orders)
 	local sentAt = bridge.pendingPings[side .. ':' .. tostring(orders.ackSeq)]
+	bridge.pendingPings[side .. ':' .. tostring(orders.ackSeq)] = nil
 	local rtt = sentAt and string.format('%.1fs', timer.getTime() - sentAt) or 'n/a'
 	local claude = type(orders.claude) == 'table' and orders.claude or {}
 	if claude.called then

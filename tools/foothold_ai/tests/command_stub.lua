@@ -276,6 +276,8 @@ function Director:_blueCandidateZone(c) return FS.bc.byName[c.zoneName] end
 function Director:onGroupStateChanged(gc, previous, current) called('onGroupStateChanged', gc.name, current) end
 function Director:onManagedSpawnDenied(gc, reason) called('originalDenied', gc.name) return false end
 function Director:recordZoneOwnershipChange(zoneName, fromSide, toSide) return fromSide ~= toSide end
+function Director:_finishOperation(result, now) called('finishOperation', result) self.operation = nil end
+function Director:_updateOperation(now) called('original:_updateOperation') end
 function Director:allowsGroupSpawn(gc) called('originalAllows', gc.name) return true end
 -- Decision methods that command mode must neutralize.
 for _, name in ipairs({ '_reconcileRoutineCaps', '_updateRestoredCapStartup', '_reconcileRoutineCapRevector',

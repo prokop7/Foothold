@@ -150,24 +150,32 @@ class BridgeTest(unittest.TestCase):
 
         claude = FakeClaude()
         bridge = sidecar.Bridge(self.exchange, claude)
+        # First pings are answered at once; one link test runs in the background for both sides.
         for side in sidecar.SIDES:
             st = bridge.read_state(side)
             self.assertIsNotNone(st)
             bridge.handle(side, st)
-        self.assertEqual(claude.calls, 2)
+        bridge.pool.shutdown(wait=True)
+        bridge.pool = sidecar.ThreadPoolExecutor(max_workers=3)
+        self.assertEqual(claude.calls, 1)
         self.assertTrue((self.exchange / "orders_red_pong.lua").read_text(encoding="utf-8").startswith("return {"))
-
         self.h.advance(5)  # poll
+
+        # The next pings carry the (shared) result.
+        self.assertIsNone(bridge.read_state("red"))
+        self.h.advance(60)
+        for side in sidecar.SIDES:
+            bridge.handle(side, bridge.read_state(side))
+        self.assertEqual(claude.calls, 1)
+        self.h.advance(5)
         logs = "\n".join(self.h.logs())
         self.assertIn("link ok side=red", logs)
         self.assertIn("link ok side=blue", logs)
         self.assertIn("claudeLatencyMs=1234", logs)
-
-        # The next ping no longer asks for Claude, and the same state is not handled twice.
-        self.assertIsNone(bridge.read_state("red"))
         self.h.advance(60)
         st = bridge.read_state("red")
         self.assertFalse(st["payload"]["wantsClaude"])
+        bridge.pool.shutdown()
 
     def test_orders_from_another_session_are_ignored(self):
         self.h.advance(10)

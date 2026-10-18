@@ -68,7 +68,8 @@ Exchange folder: <Saved Games>\DCS\Missions\Saves\FootholdAI\                   
 | `purchase` (RED: upgrade zone/category, warehouse, repair, mass_attack, bomber) | `Director:_executeStrategicBudgetCandidate` with the zone/category honoured via `selectZoneUpgradeTarget` |
 | `supply_priority`, `supply_run` | `_regularSupplyTargetPriority` bonus or starve; `_dispatchRegularSupplyCommander` |
 | `player_tasks` (BLUE) | `selectMissionTarget` |
-| `trigger_event` (RED) | `evc` scripted events |
+| `trigger_event` (RED) | `evc` scripted events; priced, with a cooldown per event |
+| `cancel_orders` | Drops delayed orders from earlier cycles that have not run yet |
 | `hq_message` (BLUE) | coalition text |
 | `standing_orders` | Lua rules: `enemy_air_near` (EWRS radar contacts), `zone_attacked` (AIEN reports, RED), `zone_lost`; with cooldown, max active, and `$zone` substitution |
 | `deploy_forces` (RED) | `CustomZone:spawnGroup` with the mission's own RED zone templates; saved to `ops_*.lua` and respawned at start |
@@ -80,7 +81,7 @@ Exchange folder: <Saved Games>\DCS\Missions\Saves\FootholdAI\                   
 
 Every order is paid from the side's Foothold account; RED earns from zones, kills and captures. See [ECONOMY.md](ECONOMY.md).
 
-Denied launches (e.g. runway blocked, origin lost) are cleaned up like the Director's own denials and reported to Claude.
+Denied launches (e.g. runway blocked, origin lost) are cleaned up like the Director's own denials, refunded, and reported to Claude. The mission only executes the answer to the snapshot it is waiting for, so late or replayed answers never double orders. Older zone groups that are not Director capabilities are listed with the capabilities (`legacy`), since the spawn gate holds them for Claude. A Foothold operation restored from a save is ended when Claude takes over.
 
 ## Phases
 

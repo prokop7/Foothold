@@ -18,8 +18,8 @@ from test_command import sample_state  # noqa: E402
 from test_foothold_ai import LuaHarness, lua51  # noqa: E402
 
 
-@unittest.skipIf(lua51 is None, "lupa not installed")
-class OpsLuaTest(unittest.TestCase):
+class OpsHarness:
+    """Loads Core, Command and Ops against the stubs; mixed into test cases."""
     config = "FootholdAIConfig = { wingman = { enabled = false } }"
 
     def setUp(self):
@@ -62,6 +62,10 @@ class OpsLuaTest(unittest.TestCase):
     def fire(self, event_id, initiator, target=None):
         self.g.STUB.fire(self.lua.table_from({"id": event_id, "initiator": initiator, "target": target}))
 
+
+
+@unittest.skipIf(lua51 is None, "lupa not installed")
+class OpsLuaTest(OpsHarness, unittest.TestCase):
     # -- economy ------------------------------------------------------------
     def test_ground_kill_paid_at_once_air_kill_on_landing(self):
         start = self.credits()
@@ -144,7 +148,8 @@ class OpsLuaTest(unittest.TestCase):
                                 targetZone="Blue Front", template="RED_L39_CAS")
         self.assertTrue(ok, detail)
         cap = self.fs.bc.directorCapabilitiesById["FAI-red-Red_Base-Blue_Front-CAS-RED_L39_CAS"]
-        self.assertEqual(cap.template, "RED_L39_CAS")
+        # Foothold resolves the side from a template set, so a single group is published as one
+        self.assertEqual(list(self.g[cap.template].values()), ["RED_L39_CAS"])
 
     # -- wave 1 ---------------------------------------------------------------
     def test_deploy_forces_limits_cost_and_persistence(self):
@@ -255,7 +260,7 @@ class OpsLuaTest(unittest.TestCase):
         name, f = self.land_flight()
         self.assertEqual(f.phase, "returning")
         self.assertEqual(f.result, "gun unloaded")
-        self.h.advance(30)
+        self.h.advance(31)
         fired = self.calls("fireAtZone")
         self.assertEqual(fired[0].args[1], "Blue Front")
         self.assertTrue(fired[0].args[2].endswith("-GUN#001"))
@@ -312,6 +317,7 @@ class OpsLuaTest(unittest.TestCase):
         self.add_jammer_template()
         ok, detail = self.order(1, type="jam", targetZone="Blue Front")
         self.assertTrue(ok, detail)
+        self.h.advance(1)
         jammer = next(iter(self.x.ops.flights.keys()))
         task = self.g.STUB.groups[jammer].controller.task
         orbit = task.params.route.points[2].task.params.tasks[1]
@@ -341,8 +347,8 @@ class OpsLuaTest(unittest.TestCase):
         self.h.advance(10)
         sr = self.g.STUB.units["red-sr"].controller
         self.assertIsNone(sr.options[0])     # 150 nm away: no jamming
-        route = self.g.STUB.groups["ewAircraft"].controller.task.params.route.points
-        self.assertEqual(route[2].task.params.tasks[1].id, "Orbit")   # sent toward the zone
+        # BLUE's jammer keeps its Mission Editor route and lifetime
+        self.assertIsNone(self.g.STUB.groups["ewAircraft"].controller.task)
         self.g.STUB.units["ew-blue"].p.x = 20000 + 25 * 1852
         self.h.advance(10)
         self.assertEqual(sr.options[0], 4)

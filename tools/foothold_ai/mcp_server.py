@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
 import sys
 
 PROTOCOL_FALLBACK = "2025-06-18"
@@ -28,6 +29,12 @@ PLAYER_TASK_ROLES = ["CAS", "SEAD", "DEAD", "CAPTURE", "RUNWAYSTRIKE", "ATTACK_S
 TRIGGERS = ["enemy_air_near", "zone_attacked", "zone_lost"]
 # Pre-built capability role -> free-form role whose price the capability fee is based on.
 FEE_ROLE = {"CAP": "CAP", "CAS": "CAS", "SEAD": "SEAD", "RUNWAYSTRIKE": "RUNWAY_STRIKE"}
+NUMERIC_ARGS = ("delay_min", "fraction", "heading_deg", "leg_nm")
+
+
+def sanitize_id(text: str) -> str:
+    """Same as the mission's sanitizeId: runs of non-alphanumerics become '_'."""
+    return re.sub(r"[^0-9A-Za-z]+", "_", str(text))
 
 
 class GameTools:
@@ -52,7 +59,11 @@ class GameTools:
         self.air_origins = {o["zone"]: o for o in ff.get("airOrigins", [])}
         self.ops = self.p.get("operations") or {}
         self.deploy_queued: dict[str, int] = {}
-        self.ops_queued: set[str] = set()
+        self.ops_queued: set = set()
+        self.freeform_queued: set[str] = set()
+        self.flights_queued = 0
+        self.ambush_queued = 0
+        self.purchased = False
         self.save()
 
     # -- helpers ---------------------------------------------------------
@@ -93,6 +104,8 @@ class GameTools:
         self.spent += price
 
     def cap_fee(self, c: dict) -> int:
+        if c.get("freeform") and c.get("price") is not None:
+            return int(c["price"])   # a free-form mission launched again costs its price again
         frac = (self.p.get("economy") or {}).get("capabilityFee") or 0
         if not frac or c.get("mission") == "supply":
             return 0
@@ -151,6 +164,7 @@ class GameTools:
             "eventsSinceLastCycle": p.get("events", []),
             "orderResultsSinceLastCycle": p.get("orderResults", []),
             "standingOrders": p.get("standingOrders", []),
+            "delayedOrdersPending": p.get("scheduledOrders", []),
             "supplyPriorities": p.get("supplyPriorities") or {},
             "yourNotesFromLastCycle": self.memory.get("notes", ""),
             "recentCycles": self.memory.get("history", [])[:5],
@@ -230,6 +244,7 @@ class GameTools:
 
     # -- order tools -----------------------------------------------------
     def launch_capability(self, capability, target_zone=None, delay_min=0):
+        delay_min = float(delay_min or 0)
         c = self.caps.get(capability)
         if not c:
             raise ValueError(f"unknown capability {capability!r}; use list_capabilities")
@@ -273,6 +288,14 @@ class GameTools:
             raise ValueError(f"{origin} cannot launch planes")
         if template is not None and template not in (r.get("templates") or []):
             raise ValueError(f"template {template!r} is not a {role} template; options: {r.get('templates') or []}")
+        ff_id = f"FAI-{self.side}-{sanitize_id(origin)}-{sanitize_id(target_zone)}-{role}"
+        if template is not None:
+            ff_id += "-" + sanitize_id(template)
+        existing = self.caps.get(ff_id)
+        if ff_id in self.freeform_queued or (existing and existing.get("state")):
+            raise ValueError(f"the same {role} mission from {origin} to {target_zone} is already flying or ordered; "
+                             "use another origin, role or template")
+        self.freeform_queued.add(ff_id)
         price = int(r.get("price", 0))
         self.spend(price, "the mission")
         eta = self.eta_min(origin, target_zone, "surface" if r.get("domain") == "surface" else
@@ -292,6 +315,14 @@ class GameTools:
         costs = {i["item"]: i["cost"] for i in options.get("items", [])}
         if item not in costs:
             raise ValueError(f"{item} is not sold in this mission")
+        if self.purchased:
+            raise ValueError("one purchase per cycle: Foothold starts a purchase cooldown after each one")
+        if options.get("purchaseCooldownSec"):
+            raise ValueError(f"purchases are on cooldown for {options['purchaseCooldownSec'] // 60 + 1} more min")
+        if item == "upgrade" and options.get("upgradeCooldownSec"):
+            raise ValueError(f"zone upgrades are on cooldown for {options['upgradeCooldownSec'] // 60 + 1} more min")
+        if item == "mass_attack" and options.get("massAttackCooldownSec"):
+            raise ValueError(f"mass attack possible again in {options['massAttackCooldownSec'] // 60 + 1} min")
         order = {"type": "purchase", "item": item}
         if item == "upgrade":
             if zone not in (options.get("upgradeZones") or []):
@@ -311,6 +342,7 @@ class GameTools:
         if self.spent + costs[item] > self.credits:
             raise ValueError(f"not enough credits: {self.credits - self.spent} left, {item} costs {costs[item]}")
         self.spent += costs[item]
+        self.purchased = True
         return self.add_order(order, 0) + f" (cost about {costs[item]})"
 
     def set_supply_priority(self, zone, priority):
@@ -337,6 +369,9 @@ class GameTools:
         return self.add_order({"type": "player_tasks", "role": role, "zones": list(zones)}, 0)
 
     def set_standing_orders(self, rules):
+        limit = self.p.get("standingOrdersMax")
+        if limit and len(rules) > limit:
+            raise ValueError(f"at most {limit} standing orders; you gave {len(rules)}")
         clean = []
         for i, r in enumerate(rules):
             rid = r.get("id") or f"rule{i + 1}"
@@ -378,8 +413,14 @@ class GameTools:
         if event not in events:
             raise ValueError(f"unknown event; options: {sorted(events)}")
         if not events[event].get("available"):
-            raise ValueError(f"{event} cannot run right now")
-        return self.add_order({"type": "trigger_event", "event": event}, 0)
+            wait = events[event].get("readyInMin")
+            raise ValueError(f"{event} cannot run right now" + (f" (possible again in {wait} min)" if wait else ""))
+        if ("event", event) in self.ops_queued:
+            raise ValueError(f"{event} is already ordered this cycle")
+        price = int(events[event].get("price") or 0)
+        self.spend(price, f"the {event} event")
+        self.ops_queued.add(("event", event))
+        return self.add_order({"type": "trigger_event", "event": event}, 0) + f" (cost {price})"
 
     def send_hq_message(self, text):
         if self.side != "blue":
@@ -419,9 +460,7 @@ class GameTools:
         if ("upgrade", zone) in self.ops_queued:
             raise ValueError(f"{zone} is already being upgraded this cycle")
         deploy_prices = (self.ops.get("prices") or {}).get("deploy", {})
-        price = deploy_prices.get(category, deploy_prices.get("other", 0))
-        if category == "sam" and any(k in template.lower() for k in ("sa-10", "sa-5", "sa-12", "sa-20", "s-300")):
-            price = deploy_prices.get("sam_long", price)
+        price = (slot.get("prices") or {}).get(template, deploy_prices.get(category, deploy_prices.get("other", 0)))
         self.spend(price, template)
         self.ops_queued.add(("upgrade", zone))
         return self.add_order({"type": "upgrade_zone", "zone": zone, "template": template}, 0) + \
@@ -429,6 +468,7 @@ class GameTools:
 
     def fire_mission(self, system, origin, target_zone, delay_min=0):
         self.red_only("fire_mission")
+        delay_min = float(delay_min or 0)
         sysrow = next((s for s in self.ops.get("fireSystems", []) if s["system"] == system), None)
         if not sysrow:
             raise ValueError(f"unknown system; options: {[s['system'] for s in self.ops.get('fireSystems', [])]}")
@@ -457,6 +497,11 @@ class GameTools:
             raise ValueError("no RED AWACS in this mission")
         if not self.own(zone):
             raise ValueError("the AWACS orbits over your own zones")
+        if self.ops.get("awacsReadyInMin"):
+            raise ValueError(f"the AWACS can move again in {self.ops['awacsReadyInMin']} min")
+        if "awacs" in self.ops_queued:
+            raise ValueError("the AWACS is already ordered to move this cycle")
+        self.ops_queued.add("awacs")
         price = (self.ops.get("prices") or {}).get("awacs", 0)
         self.spend(price, "moving the AWACS")
         return self.add_order({"type": "move_awacs", "zone": zone, "headingDeg": heading_deg, "legNm": leg_nm}, 0)
@@ -469,6 +514,17 @@ class GameTools:
         self.spend(price, "the airlift")
         return self.add_order({"type": "supply_airlift", "zone": zone}, 0) + \
             f" (cost {price}, adds {self.ops.get('airliftUnits', 3)} supply units)"
+
+    def _flight_slot(self, ambush=False):
+        limits = self.ops.get("limits") or {}
+        flying = len(self.ops.get("flights", [])) + self.flights_queued
+        if limits.get("activeFlights") and flying >= limits["activeFlights"]:
+            raise ValueError(f"{flying} RED operations already flying or ordered (limit {limits['activeFlights']})")
+        if ambush and limits.get("ambushTeams"):
+            teams = sum(1 for t in self.ops.get("groundTeams", []) if t.get("kind") == "ambush")
+            teams += sum(1 for f in self.ops.get("flights", []) if f.get("operation") == "ambush") + self.ambush_queued
+            if teams >= limits["ambushTeams"]:
+                raise ValueError(f"{teams} ambush teams already out or ordered (limit {limits['ambushTeams']})")
 
     def _helo_origin(self, origin, target):
         if origin not in (self.ops.get("heloOrigins") or []):
@@ -487,8 +543,11 @@ class GameTools:
         if not z or z["side"] in (self.side, "neutral"):
             raise ValueError("target must be an enemy zone")
         self._helo_origin(origin, target_zone)
+        self._flight_slot()
+        delay_min = float(delay_min or 0)
         price = (self.ops.get("prices") or {}).get("heli_raid", 0)
         self.spend(price, "the raid")
+        self.flights_queued += 1
         return self.add_order({"type": "heli_raid", "origin": origin, "targetZone": target_zone, "gun": gun},
                               delay_min) + \
             f" (cost {price}; a Mi-8 lands the gun about {round(guns[gun]['rangeKm'] * 0.8)} km from {target_zone}" \
@@ -500,8 +559,11 @@ class GameTools:
         if not z or z["side"] != "neutral":
             raise ValueError("air assault needs a neutral zone")
         self._helo_origin(origin, target_zone)
+        self._flight_slot()
+        delay_min = float(delay_min or 0)
         price = (self.ops.get("prices") or {}).get("air_assault", 0)
         self.spend(price, "the air assault")
+        self.flights_queued += 1
         return self.add_order({"type": "air_assault", "origin": origin, "targetZone": target_zone}, delay_min) + \
             f" (cost {price}; the troops capture the zone if they survive the capture time)"
 
@@ -512,10 +574,15 @@ class GameTools:
         if from_zone not in self.zones or toward_zone not in self.zones:
             raise ValueError("from_zone and toward_zone must be known zones")
         self._helo_origin(origin, from_zone)
+        self._flight_slot(ambush=True)
+        fraction = max(0.1, min(0.9, float(fraction)))
+        delay_min = float(delay_min or 0)
         price = (self.ops.get("prices") or {}).get("ambush", 0)
         self.spend(price, "the ambush team")
+        self.flights_queued += 1
+        self.ambush_queued += 1
         return self.add_order({"type": "ambush", "origin": origin, "fromZone": from_zone, "towardZone": toward_zone,
-                               "fraction": max(0.1, min(0.9, float(fraction))), "team": team}, delay_min) + \
+                               "fraction": fraction, "team": team}, delay_min) + \
             f" (cost {price})"
 
     def jam(self, target_zone, delay_min=0):
@@ -528,12 +595,23 @@ class GameTools:
         z = self.zones.get(target_zone)
         if not z or z["side"] in (self.side, "neutral"):
             raise ValueError("target must be an enemy zone")
+        self._flight_slot()
+        delay_min = float(delay_min or 0)
         price = (self.ops.get("prices") or {}).get("jam", 0)
         self.spend(price, "the jammer")
+        self.flights_queued += 1
         self.ops_queued.add("jam")
         return self.add_order({"type": "jam", "targetZone": target_zone}, delay_min) + \
-            f" (cost {price}; SAM radars of {target_zone} within {jammer.get('rangeNm')} nm of the jammer hold fire " \
+            f" (cost {price}; SAM radars of {target_zone} within {jammer.get('rangeNm')} nm of the jammer " \
+            f"({jammer.get('longRangeSamRangeNm')} nm for long-range SAMs) hold fire " \
             f"for up to {jammer.get('minutes')} min while it lives - escort it)"
+
+    def cancel_orders(self, order_ids):
+        pending = {o["order"] for o in self.p.get("scheduledOrders", [])}
+        unknown = [i for i in order_ids if i not in pending]
+        if unknown:
+            raise ValueError(f"not pending: {unknown}; pending delayed orders: {sorted(pending)}")
+        return self.add_order({"type": "cancel_orders", "ids": list(order_ids)}, 0)
 
     def finish_cycle(self, summary, notes=""):
         self.summary = str(summary)[:600]
@@ -602,6 +680,9 @@ def tool_specs(side: str) -> list[dict]:
                             "capability": _s("string"), "origin": _s("string"), "role": _s("string"),
                             "target_zone": _s("string")}, ["type"]),
          }, ["id", "trigger", "zone", "action"])}}, ["rules"])),
+        ("cancel_orders", "Cancel delayed orders from earlier cycles that have not run yet "
+                          "(get_overview -> delayedOrdersPending), e.g. when the plan changed.",
+         obj({"order_ids": {"type": "array", "items": _s("string")}}, ["order_ids"])),
         ("finish_cycle", "End the cycle. summary: what you did and why (logged). notes: what you want to remember "
                          "next cycle (plans in progress, intended timings, things to check).",
          obj({"summary": _s("string"), "notes": _s("string")}, ["summary"])),
@@ -700,10 +781,16 @@ def serve(tools: GameTools, stdin=sys.stdin, stdout=sys.stdout):
                     raise ValueError("cycle already finished; stop now")
                 if tools.calls > MAX_TOOL_CALLS and name != "finish_cycle":
                     raise ValueError("tool budget for this cycle used up; call finish_cycle now")
+                for key in NUMERIC_ARGS:
+                    if args.get(key) is not None:
+                        try:
+                            args[key] = float(args[key])
+                        except (TypeError, ValueError):
+                            raise ValueError(f"{key} must be a number") from None
                 result = getattr(tools, name)(**args)
                 text = result if isinstance(result, str) else json.dumps(result, separators=(",", ":"))
                 send({"jsonrpc": "2.0", "id": mid, "result": {"content": [{"type": "text", "text": text}]}})
-            except (ValueError, TypeError) as exc:
+            except Exception as exc:  # any bad argument must not end the session
                 send({"jsonrpc": "2.0", "id": mid, "result": {
                     "content": [{"type": "text", "text": f"Error: {exc}"}], "isError": True}})
             tools.save()
@@ -717,6 +804,10 @@ def main(argv=None):
     ap.add_argument("--out", required=True)
     ap.add_argument("--memory", required=True)
     args = ap.parse_args(argv)
+    # Claude Code talks UTF-8; Windows pipes would otherwise use the ANSI code page.
+    for stream in (sys.stdin, sys.stdout):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
     with open(args.state, encoding="utf-8") as f:
         state = json.load(f)
     try:

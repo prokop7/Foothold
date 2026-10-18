@@ -55,6 +55,15 @@ end
 
 function X.controls(side) return X.sides[side] == true end
 
+-- The bridge must read orders for every commanded side.
+do
+	local polled = {}
+	for _, name in ipairs(FAI.config.bridge.sides) do polled[name] = true end
+	for side in pairs(X.sides) do
+		if not polled[SIDE_NAME[side]] then table.insert(FAI.config.bridge.sides, SIDE_NAME[side]) end
+	end
+end
+
 local function bcObj()
 	local d = Director:getForSide(RED) or Director:getForSide(BLUE)
 	return d and d.battleCommander or bc
@@ -126,7 +135,8 @@ local NEUTRAL = {
 	{ '_reconcileBlueRoutinePatrolPosition', nil }, { '_blueAdoptActiveAttackMission', nil },
 	{ '_blueReassessSupportFocus', nil }, { '_blueReconcileAssignments', nil },
 	-- reactions requested by other Foothold systems
-	{ 'requestReaction', false }, { 'requestReactiveCap', false },
+	{ 'requestReaction', 0 }, { 'requestReactiveCap', 0 },   -- callers compare these with numbers
+	{ '_reconcileOperationCapacity', nil },
 	{ 'requestEnemyPositionResponse', false }, { 'considerAIENAirSupport', false },
 	{ 'considerCapturedZoneCasDiversion', false }, { 'requestZoneUpgrade', false },
 	{ 'requestPlayerCapResponse', false },
@@ -138,6 +148,24 @@ for _, entry in ipairs(NEUTRAL) do
 		return original(self, ...)
 	end)
 end
+
+-- An operation restored from a save would keep launching; end it through
+-- Foothold's own path the first time the Director updates it.
+wrap(Director, 'Director', '_updateOperation', function(original, self, now, ...)
+	if X.controls(self.side) then
+		if self.operation then
+			FAI.log('command', '%s: ending Foothold operation on %s restored from the save', SIDE_NAME[self.side],
+				tostring(self.operation.targetZone))
+			local ok, err = pcall(self._finishOperation, self, 'aborted', now)
+			if not ok then
+				FAI.warn('command', 'could not end restored operation: %s', tostring(err))
+				self.operation = nil
+			end
+		end
+		return
+	end
+	return original(self, now, ...)
+end)
 
 -- Purchases only when Claude ordered them.
 wrap(Director, 'Director', '_executeStrategicBudgetCandidate', function(original, self, ...)
@@ -219,17 +247,19 @@ end
 
 local econ = cfg.economy or {}
 X.ledger = { red = {}, blue = {} }
-X.flow = { red = { spent = 0, earned = 0 }, blue = { spent = 0, earned = 0 } }
+X.flow = { red = { spent = 0, earned = 0, refunded = 0 }, blue = { spent = 0, earned = 0, refunded = 0 } }
 X.lastCredits = {}
 X.unpaidKills = {}   -- [unitName] = { side, amount, kills }: air kills, paid on landing
 
-function X.book(side, amount, what)
+function X.book(side, amount, what, refund)
 	local sideName = SIDE_NAME[side]
 	if not X.ledger[sideName] or amount == 0 then return end
 	pushLimited(X.ledger[sideName], { minute = round(timer.getAbsTime() / 60), amount = round(amount), what = what },
 		econ.ledgerSize or 25)
 	local f = X.flow[sideName]
-	if amount < 0 then f.spent = f.spent - amount else f.earned = f.earned + amount end
+	if refund then f.refunded = f.refunded + amount
+	elseif amount < 0 then f.spent = f.spent - amount
+	else f.earned = f.earned + amount end
 end
 
 -- nil when the side can pay, else the reason it cannot.
@@ -252,6 +282,20 @@ function X.credit(side, amount, what)
 	if amount <= 0 then return end
 	bcObj():addFunds(side, amount)
 	X.book(side, amount, what)
+end
+
+-- Gives back what an order cost when it never happened (spawn denied, never launched).
+function X.refund(side, amount, what)
+	amount = math.floor(tonumber(amount) or 0)
+	if amount <= 0 then return end
+	bcObj():addFunds(side, amount)
+	X.book(side, amount, 'refund: ' .. what, true)
+end
+
+local function refundMission(m, why)
+	if not m or m.refunded or not m.cost then return end
+	m.refunded = true
+	X.refund(m.side, m.cost, why .. ' (' .. tostring(m.group) .. ')')
 end
 
 local function econOn(list, side)
@@ -315,6 +359,14 @@ local function settleKills(unitName, landed)
 	end
 end
 
+-- An aircraft removed without a landing or loss event (e.g. despawned) counts as lost.
+local function pruneUnpaidKills()
+	for name in pairs(X.unpaidKills) do
+		local unit = Unit and Unit.getByName and Unit.getByName(name)
+		if not (unit and unit:isExist()) then settleKills(name, false) end
+	end
+end
+
 local LOST_EVENTS = {}
 for _, k in ipairs({ 'S_EVENT_DEAD', 'S_EVENT_CRASH', 'S_EVENT_PILOT_DEAD', 'S_EVENT_EJECTION', 'S_EVENT_UNIT_LOST' }) do
 	if world.event[k] then LOST_EVENTS[world.event[k]] = true end
@@ -354,6 +406,7 @@ local function economyRow(side, b)
 		incomePerMinute = round(zoneIncome * 60 / updateFrequency + (tonumber((econ.bonusIncomePerMin or {})[sideName]) or 0)),
 		sinceLastSnapshot = {
 			spentOnOrders = round(f.spent), earnedFromCombat = round(f.earned),
+			refunded = f.refunded > 0 and round(f.refunded) or nil,
 			netChange = X.lastCredits[sideName] and (credits - X.lastCredits[sideName]) or nil,
 		},
 		unpaidAirKills = unpaid > 0 and round(unpaid) or nil,
@@ -361,7 +414,7 @@ local function economyRow(side, b)
 		capabilityFee = fee > 0 and fee or nil,
 		ledger = FAI.json.array(X.ledger[sideName]),
 	}
-	X.flow[sideName] = { spent = 0, earned = 0 }
+	X.flow[sideName] = { spent = 0, earned = 0, refunded = 0 }
 	X.lastCredits[sideName] = credits
 	return row
 end
@@ -399,6 +452,15 @@ function X.templateSide(name)
 	return entry and entry.CoalitionID or nil
 end
 
+-- Foothold resolves a capability's side from a template set; a single ME group
+-- chosen by Claude is published as a one-element set.
+function X.templateKey(template)
+	if templateSet(template) then return template end
+	local key = 'FootholdAI_TPL_' .. tostring(template):gsub('[^%w]+', '_')
+	_G[key] = { template }
+	return key
+end
+
 function X.roleTemplates(roleName, side)
 	local role = X.ROLES[roleName]
 	local out = {}
@@ -420,6 +482,8 @@ local function findLaunchable(ref)
 	return nil, nil
 end
 
+function X.missionKey(side, orderId) return SIDE_NAME[side] .. '/' .. tostring(orderId) end
+
 local function trackMission(side, order, gc, extra)
 	local m = {
 		order = order.id, side = side, group = gc.name, gc = gc,
@@ -428,8 +492,9 @@ local function trackMission(side, order, gc, extra)
 		status = gc.state, source = order.source,
 	}
 	for k, v in pairs(extra or {}) do m[k] = v end
-	X.missions[order.id] = m
-	X.authorized[gc.name] = { at = timer.getAbsTime(), orderId = order.id, side = side }
+	local key = X.missionKey(side, order.id)
+	X.missions[key] = m
+	X.authorized[gc.name] = { at = timer.getAbsTime(), orderId = key, side = side }
 	return m
 end
 
@@ -462,7 +527,18 @@ function X.launchCapability(side, order)
 	local targetZone = order.targetZone or (cap and cap.targetzone or gc.targetzone)
 	local tz = b:getZoneByName(targetZone)
 	if not tz or not tz.active or tz.isHidden then return false, 'unknown target zone' end
-	local fee = order.freeform and 0 or capabilityFee(side, cap and cap.MissionType or gc.MissionType)
+	-- A free-form mission launched again costs its full price again.
+	local spec = cap and cap.footholdAI and X.freeformSpecs[cap.id]
+	local fee
+	if order.freeform then fee = 0
+	elseif spec then fee = X.priceFor(spec.role)
+	else fee = capabilityFee(side, cap and cap.MissionType or gc.MissionType) end
+	if targetZone ~= (cap and cap.targetzone or gc.targetzone) then
+		local okR, role = pcall(d._groupRole, d, gc or cap)
+		if not (okR and d:_canRetaskAirRole(role)) then
+			return false, 'role ' .. tostring(role) .. ' cannot be sent to another target'
+		end
+	end
 	if fee > 0 then
 		local short = X.needCredits(side, fee)
 		if short then return false, short end
@@ -477,14 +553,8 @@ function X.launchCapability(side, order)
 		gc = b:resolveDirectorCandidate(candidate, request)
 		if not gc then return false, 'activation denied' end
 	end
-	if targetZone ~= gc.targetzone then
-		local role = d:_groupRole(gc)
-		if not d:_canRetaskAirRole(role) then
-			return false, 'role ' .. tostring(role) .. ' cannot be sent to another target'
-		end
-		d:_retaskGroupForAssignment(gc, targetZone, nil)
-	end
-	X.authorized[gc.name] = { at = now, orderId = order.id, side = side }
+	if targetZone ~= gc.targetzone then d:_retaskGroupForAssignment(gc, targetZone, nil) end
+	X.authorized[gc.name] = { at = now, orderId = X.missionKey(side, order.id), side = side }
 	local ok
 	if gc._directorOnDemand == true then
 		ok = b:_authorizeDirectorOnDemandGroup(gc, now, d)
@@ -493,11 +563,15 @@ function X.launchCapability(side, order)
 	end
 	if not ok then
 		X.authorized[gc.name] = nil
+		if gc._directorRetaskOriginalTargetZone or gc._directorRetaskOriginalMission then
+			pcall(d._restoreRetaskedGroup, d, gc)
+		end
+		if cap and gc._directorOnDemand == true then pcall(b.requestDirectorInstanceDisposal, b, gc) end
 		return false, 'group not ready (state ' .. tostring(gc.state) .. ')'
 	end
 	local m = trackMission(side, order, gc)
 	if fee > 0 then
-		X.charge(side, fee, 'sortie ' .. gc.name)
+		X.charge(side, fee, (spec and 'relaunch ' or 'sortie ') .. gc.name)
 		m.cost = fee
 	end
 	return true, string.format('%s from %s to %s%s', gc.name, origin.zone, targetZone,
@@ -513,7 +587,8 @@ local function registerFreeform(spec)
 	if not origin then return nil, 'unknown origin' end
 	local cap = DirectorCapability:new({
 		id = spec.id, name = spec.id, mission = spec.mission, MissionType = spec.missionType,
-		template = spec.template, targetzone = spec.target, type = spec.type, Altitude = spec.altitude,
+		template = spec.template and X.templateKey(spec.template), targetzone = spec.target, type = spec.type,
+		Altitude = spec.altitude,
 		footholdAI = true,
 	})
 	local ok, err = pcall(b.registerDirectorCapability, b, origin, cap)
@@ -594,7 +669,8 @@ function X.launchMission(side, order)
 	local launched, detail = X.launchCapability(side, { id = order.id, capability = id, source = order.source, freeform = true })
 	if not launched then return false, detail end
 	X.charge(side, price, string.format('%s %s -> %s', order.role, origin.zone, target.zone))
-	if X.missions[order.id] then X.missions[order.id].cost = price end
+	local m = X.missions[X.missionKey(side, order.id)]
+	if m then m.cost = price end
 	return true, detail .. string.format(' (cost %d)', price)
 end
 
@@ -645,6 +721,9 @@ function X.purchase(side, order)
 		if not z or z.side ~= side then return false, 'depot zone must be a RED zone' end
 		candidate.zoneRef = z
 	elseif action == 'mass_attack' or action == 'bomber' then
+		if action == 'mass_attack' and now < (X.massAttackReadyAt or 0) then
+			return false, string.format('mass attack possible again in %d min', math.ceil((X.massAttackReadyAt - now) / 60))
+		end
 		local targets = {}
 		for _, name in ipairs(order.targets or {}) do
 			local z = b:getZoneByName(name)
@@ -665,6 +744,7 @@ function X.purchase(side, order)
 	if not ok then return false, 'purchase error: ' .. tostring(purchased) end
 	if not purchased then return false, failure or 'purchase refused (credits, cooldown or no valid placement)' end
 	X.book(side, -(tonumber(cost) or tonumber(shopItem.cost) or 0), 'purchase ' .. action .. ' ' .. tostring(where or ''))
+	if action == 'mass_attack' then X.massAttackReadyAt = now + (cfg.massAttackCooldownSec or 3600) end
 	return true, string.format('%s at %s for %s', action, tostring(where or order.zone or ''), tostring(cost or shopItem.cost))
 end
 
@@ -703,16 +783,33 @@ wrap(Director, 'Director', 'selectMissionTarget', function(original, self, role,
 	return nil
 end)
 
+X.eventReadyAt = {}
+
+function X.eventPrice(id)
+	local p = cfg.prices or {}
+	return X.shopPrice((p.events or {})[id] or p.event or 1000)
+end
+
 local function triggerEvent(side, order)
 	if side ~= RED then return false, 'scripted events are RED only' end
 	if not (evc and evc.events) then return false, 'no event commander in this mission' end
 	for _, ev in ipairs(evc.events) do
 		if ev.id == order.event and ev.StrikeMission ~= true then
+			local now = timer.getAbsTime()
+			local readyAt = X.eventReadyAt[ev.id] or 0
+			if now < readyAt then
+				return false, string.format('%s possible again in %d min', ev.id, math.ceil((readyAt - now) / 60))
+			end
+			local price = X.eventPrice(ev.id)
+			local short = X.needCredits(side, price)
+			if short then return false, short end
 			local okCan, can = pcall(ev.canExecute, ev)
 			if not okCan or not can then return false, 'event cannot run now' end
 			local okRun, err = pcall(ev.action, ev)
 			if not okRun then return false, 'event error: ' .. tostring(err) end
-			return true, 'event ' .. order.event .. ' started'
+			X.eventReadyAt[ev.id] = now + (cfg.eventCooldownSec or 3600)
+			X.charge(side, price, 'event ' .. ev.id)
+			return true, string.format('event %s started (cost %d)', order.event, price)
 		end
 	end
 	return false, 'unknown event'
@@ -750,7 +847,23 @@ local executors = {
 	standing_orders = function(side, order)
 		return X.setStandingOrders(SIDE_NAME[side], order.rules)
 	end,
+	cancel_orders = function(side, order)
+		local done, unknown = {}, {}
+		for _, id in ipairs(type(order.ids) == 'table' and order.ids or {}) do
+			local key = X.missionKey(side, id)
+			if X.scheduled[key] then
+				X.scheduled[key] = nil
+				done[#done + 1] = tostring(id)
+			else
+				unknown[#unknown + 1] = tostring(id)
+			end
+		end
+		local detail = 'cancelled: ' .. (#done > 0 and table.concat(done, ', ') or 'none')
+		if #unknown > 0 then detail = detail .. '; not pending: ' .. table.concat(unknown, ', ') end
+		return #done > 0, detail
+	end,
 }
+X.scheduled = {}   -- [side/orderId] = { order, dueAt } delayed orders not yet executed
 
 X.executors = executors
 X.snapshotExtensions = {}
@@ -788,6 +901,7 @@ wrap(Director, 'Director', 'onGroupStateChanged', function(original, self, gc, p
 				m.endedAt = timer.getAbsTime()
 				m.outcome = (previousState == 'preparing' and not wasSpawned) and 'spawn-failed'
 					or (currentState == 'dead' and 'lost' or 'returned')
+				if m.outcome == 'spawn-failed' then refundMission(m, 'spawn failed') end
 				X.event(SIDE_NAME[m.side], 'mission_ended', { order = m.order, group = m.group,
 					target = m.target, outcome = m.outcome })
 			end
@@ -801,7 +915,10 @@ wrap(Director, 'Director', 'onManagedSpawnDenied', function(original, self, gc, 
 	if auth and X.controls(self.side) then
 		X.authorized[gc.name] = nil
 		local m = X.missions[auth.orderId]
-		if m then m.status, m.outcome, m.endedAt = 'denied', tostring(reason), timer.getAbsTime() end
+		if m then
+			m.status, m.outcome, m.endedAt = 'denied', tostring(reason), timer.getAbsTime()
+			refundMission(m, 'launch denied: ' .. tostring(reason))
+		end
 		X.event(SIDE_NAME[self.side], 'launch_denied', { order = auth.orderId, group = gc.name, reason = tostring(reason) })
 		-- Same clean-up the Director does for a denied routine CAP, so the
 		-- capability can be launched again later.
@@ -825,7 +942,10 @@ local function expireAuthorizations()
 		local live = gc and (Director.LIVE_STATES[gc.state] or gc.Spawned == true)
 		if not live and now - auth.at > cfg.authorizationTimeoutSec then
 			X.authorized[name] = nil
-			if m then m.status, m.outcome, m.endedAt = 'expired', 'never launched', now end
+			if m then
+				m.status, m.outcome, m.endedAt = 'expired', 'never launched', now
+				refundMission(m, 'never launched')
+			end
 		end
 	end
 end
@@ -841,19 +961,20 @@ function X.setStandingOrders(sideName, rules)
 	local b = bcObj()
 	local out, rejected = {}, {}
 	for i, r in ipairs(type(rules) == 'table' and rules or {}) do
-		if #out >= cfg.maxStandingOrders then break end
 		local problem
-		if type(r) ~= 'table' or not X.TRIGGERS[r.trigger] then problem = 'bad trigger'
+		if #out >= cfg.maxStandingOrders then problem = 'over the limit of ' .. cfg.maxStandingOrders .. ' rules'
+		elseif type(r) ~= 'table' or not X.TRIGGERS[r.trigger] then problem = 'bad trigger'
 		elseif r.zone ~= '*' and not b:getZoneByName(r.zone or '') then problem = 'unknown zone'
 		elseif r.trigger == 'zone_attacked' and side ~= RED then problem = 'zone_attacked is reported for RED zones only'
 		elseif type(r.action) ~= 'table' or (r.action.type ~= 'launch_capability' and r.action.type ~= 'launch_mission') then
 			problem = 'action must be launch_capability or launch_mission'
 		end
 		if problem then
-			rejected[#rejected + 1] = tostring(r and r.id or i) .. ': ' .. problem
+			rejected[#rejected + 1] = tostring(type(r) == 'table' and r.id or i) .. ': ' .. problem
 		else
 			out[#out + 1] = {
-				id = type(r.id) == 'string' and r.id:sub(1, 40) or ('rule' .. i),
+				-- ASCII only, so cutting to 40 bytes never splits a character
+				id = type(r.id) == 'string' and (r.id:gsub('[^%w%-_]', '_')):sub(1, 40) or ('rule' .. i),
 				trigger = r.trigger, zone = r.zone,
 				radiusNm = math.max(5, math.min(150, tonumber(r.radiusNm) or 40)),
 				minContacts = math.max(1, math.floor(tonumber(r.minContacts) or 1)),
@@ -950,10 +1071,20 @@ local function onZoneTrigger(sideName, trigger, zoneName, why)
 	end
 end
 
+-- One zone_attacked event per zone per minute, so a long attack does not push
+-- other events out of the snapshot.
+X.lastAttackEventAt = {}
+local function attackEvent(zoneName, by)
+	local now = timer.getAbsTime()
+	if now - (X.lastAttackEventAt[zoneName] or -1e9) < 60 then return end
+	X.lastAttackEventAt[zoneName] = now
+	X.event('red', 'zone_attacked', { zone = zoneName, by = by })
+end
+
 wrap(BattleCommander, 'BattleCommander', 'reportAIENAirSupportAttack', function(original, self, zoneObj, attackerCategory, attackerType, ...)
 	local result = original(self, zoneObj, attackerCategory, attackerType, ...)
 	if zoneObj and X.controls(RED) and zoneObj.side == RED then
-		X.event('red', 'zone_attacked', { zone = zoneObj.zone, by = tostring(attackerType or attackerCategory) })
+		attackEvent(zoneObj.zone, tostring(attackerType or attackerCategory))
 		onZoneTrigger('red', 'zone_attacked', zoneObj.zone, 'attacked from the air')
 	end
 	return result
@@ -962,7 +1093,7 @@ end)
 wrap(BattleCommander, 'BattleCommander', 'reportAIENEnemyPositionAttack', function(original, self, zoneObj, targetPoint, attackerKind, ...)
 	local result = original(self, zoneObj, targetPoint, attackerKind, ...)
 	if zoneObj and X.controls(RED) and zoneObj.side == RED then
-		X.event('red', 'zone_attacked', { zone = zoneObj.zone, by = tostring(attackerKind) })
+		attackEvent(zoneObj.zone, tostring(attackerKind))
 		onZoneTrigger('red', 'zone_attacked', zoneObj.zone, 'attacked on the ground')
 	end
 	return result
@@ -978,7 +1109,7 @@ wrap(Director, 'Director', 'recordZoneOwnershipChange', function(original, self,
 			if fromSide == side then onZoneTrigger(sideName, 'zone_lost', zoneName, 'zone lost') end
 		end
 		if econOn(econ.captureReward, toSide) then
-			local r = self.battleCommander and self.battleCommander.rewards or {}
+			local r = bcObj().rewards or {}
 			X.credit(toSide, math.floor((tonumber(r['Zone capture']) or 200) * (econ.rewardScale or 1)),
 				'captured ' .. tostring(zoneName))
 		end
@@ -1097,7 +1228,7 @@ local function purchaseOptions(b, d)
 		local item = d:_strategicShopEntry(action)
 		if item then out[#out + 1] = { item = action, cost = item.cost } end
 	end
-	local okC, choices = pcall(b._redZoneUpgradeChoices, b, false)
+	local okC, choices = pcall(b._redZoneUpgradeChoices, b, true)
 	local upgradeZones = {}
 	if okC then for _, c in ipairs(choices or {}) do upgradeZones[#upgradeZones + 1] = c.zone.zone end end
 	local now = timer.getAbsTime()
@@ -1107,6 +1238,7 @@ local function purchaseOptions(b, d)
 		upgradeCategories = FAI.json.array({ 'sam', 'shorad', 'aaa', 'armor', 'ground', 'arty' }),
 		purchaseCooldownSec = math.max(0, round((d.strategicSpendCooldownUntil or 0) - now)),
 		upgradeCooldownSec = math.max(0, round((d.zoneUpgradeCooldownUntil or 0) - now)),
+		massAttackCooldownSec = math.max(0, round((X.massAttackReadyAt or 0) - now)),
 	}
 end
 
@@ -1115,7 +1247,9 @@ local function eventOptions()
 	for _, ev in ipairs(evc and evc.events or {}) do
 		if ev.StrikeMission ~= true and type(ev.id) == 'string' then
 			local ok, can = pcall(ev.canExecute, ev)
-			out[#out + 1] = { event = ev.id, available = ok and can == true }
+			local wait = (X.eventReadyAt[ev.id] or 0) - timer.getAbsTime()
+			out[#out + 1] = { event = ev.id, available = ok and can == true and wait <= 0, price = X.eventPrice(ev.id),
+				readyInMin = wait > 0 and math.ceil(wait / 60) or nil }
 		end
 	end
 	return out
@@ -1128,6 +1262,8 @@ local function capabilityRow(b, cap, side)
 		id = cap.id, origin = origin.zone, target = cap.targetzone, mission = cap.mission,
 		role = cap.MissionType, domain = cap.type or 'air', freeform = cap.footholdAI or nil,
 	}
+	local spec = cap.footholdAI and X.freeformSpecs[cap.id]
+	if spec then row.price = X.priceFor(spec.role) end
 	if instance and (Director.LIVE_STATES[instance.state] or instance.state == 'preparing') then
 		row.state = instance.state
 		row.available = false
@@ -1141,6 +1277,45 @@ local function capabilityRow(b, cap, side)
 	row.available = ok and eligible == true
 	if not row.available then row.reason = ok and tostring(reason or 'unavailable') or 'check failed' end
 	return row
+end
+
+-- Zone groups that are not Director capabilities (older map scripting). The spawn
+-- gate holds them for Claude, so they are offered like capabilities.
+local LEGACY_MISSIONS = { attack = true, patrol = true }
+local function legacyRows(b, side)
+	local rows = {}
+	for _, z in ipairs(b.zones or {}) do
+		if z.side == side and zoneUsable(z) then
+			for _, gc in ipairs(z.groups or {}) do
+				if #rows >= 80 then return rows end
+				if (gc.side or z.side) == side and LEGACY_MISSIONS[gc.mission] and gc._directorOnDemand ~= true
+					and not gc.playerGroundAttack and not gc.ShopLaunchOnly and not gc.forceSpawn then
+					local busy = Director.LIVE_STATES[gc.state] or gc.state == 'preparing'
+					rows[#rows + 1] = {
+						id = gc.name, origin = z.zone, target = gc.targetzone, mission = gc.mission,
+						role = gc.MissionType, domain = gc.type or 'air', legacy = true,
+						state = busy and gc.state or nil,
+						available = not busy and (gc.state == 'inhangar' or gc.state == 'dead'),
+						reason = (not busy and gc.state ~= 'inhangar' and gc.state ~= 'dead') and tostring(gc.state) or nil,
+					}
+				end
+			end
+		end
+	end
+	return rows
+end
+
+local function scheduledRows(side)
+	local out, prefix = {}, SIDE_NAME[side] .. '/'
+	local now = timer.getAbsTime()
+	for key, e in pairs(X.scheduled) do
+		if key:sub(1, #prefix) == prefix then
+			out[#out + 1] = { order = e.order.id, type = e.order.type, inMin = math.max(0, math.ceil((e.dueAt - now) / 60)),
+				capability = e.order.capability, role = e.order.role, origin = e.order.origin, target = e.order.targetZone }
+		end
+	end
+	table.sort(out, function(a, c) return a.inMin < c.inMin end)
+	return out
 end
 
 local function finishSnapshot(sideName, job)
@@ -1165,6 +1340,8 @@ local function finishSnapshot(sideName, job)
 		events = FAI.json.array(X.events[sideName]),
 		orderResults = FAI.json.array(X.results[sideName]),
 		standingOrders = FAI.json.array(standing),
+		standingOrdersMax = cfg.maxStandingOrders,
+		scheduledOrders = FAI.json.array(scheduledRows(side)),
 		supplyPriorities = X.supplyPriority[sideName],
 	}
 	if sideName == 'red' then
@@ -1214,6 +1391,8 @@ function X.request(sideName, reason)
 		job.index = last + 1
 		if job.index <= #job.caps then return t + 0.2 end
 		X.building[sideName] = nil
+		local okL, legacy = pcall(legacyRows, b, side)
+		for _, row in ipairs(okL and legacy or {}) do job.rows[#job.rows + 1] = row end
 		local ok, err = pcall(finishSnapshot, sideName, job)
 		if not ok then FAI.warn('command', '%s snapshot failed: %s', sideName, tostring(err)) end
 		return nil
@@ -1222,6 +1401,13 @@ end
 
 FAI.bridge.onOrders('command', function(sideName, orders)
 	local side = SIDE_ID[sideName]
+	-- Only the answer to the snapshot the mission is waiting for counts. A late
+	-- answer to an earlier (retried) snapshot, or a replay, would duplicate orders.
+	if X.awaiting[sideName] == nil or orders.ackSeq ~= X.awaiting[sideName] then
+		FAI.warn('command', '%s orders for snapshot %s ignored (waiting for %s)', sideName,
+			tostring(orders.ackSeq), tostring(X.awaiting[sideName]))
+		return
+	end
 	X.awaiting[sideName] = nil
 	local list = type(orders.orders) == 'table' and orders.orders or {}
 	FAI.log('command', '%s received %d orders (cycle %s): %s', sideName, #list,
@@ -1232,7 +1418,12 @@ FAI.bridge.onOrders('command', function(sideName, orders)
 			local delay = math.max(0, math.min(3600, tonumber(order.delaySec) or 0))
 			if delay > 0 then
 				X.result(sideName, order.id, 'scheduled', string.format('%s in %d s', tostring(order.type), delay))
+				local key = X.missionKey(side, order.id)
+				local entry = { order = order, dueAt = timer.getAbsTime() + delay }
+				X.scheduled[key] = entry
 				timer.scheduleFunction(function()
+					if X.scheduled[key] ~= entry then return nil end   -- cancelled
+					X.scheduled[key] = nil
 					local ok, detail = X.execute(side, order)
 					X.result(sideName, order.id, ok and 'executed' or 'rejected', detail)
 				end, nil, timer.getTime() + delay)
@@ -1247,6 +1438,7 @@ end)
 local function tick()
 	expireAuthorizations()
 	bonusIncomeTick(15)
+	pruneUnpaidKills()
 	local now = timer.getAbsTime()
 	for side in pairs(X.sides) do
 		local sideName = SIDE_NAME[side]

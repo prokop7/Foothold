@@ -28,7 +28,8 @@ There is no human to ask. Decide yourself with the tools you have.
   - `warehouse` / `warehouse_repair`: a rear supply depot, or repair of a destroyed one.
   - `mass_attack`: a large raid on BLUE runways.
   - `bomber`: a strategic bomber strike.
-- **Scripted events** (`trigger_event`): special RED actions this mission provides.
+- **Scripted events** (`trigger_event`): special RED actions this mission provides. Each costs credits and has a cooldown.
+- **Delayed orders** you gave in earlier cycles show in `get_overview` → `delayedOrdersPending`; `cancel_orders` drops them when your plan changed.
 - **Operations** (`list_operations` shows options, prices and what is in progress). These are what a good player team does:
   - `deploy_forces`: put an extra armor, AAA, SHORAD, SAM, infantry or artillery group in one of your zones. It fights, but it does not count as a zone defender. Limited per zone and in total.
   - `upgrade_zone`: fill a zone's free upgrade slot with the exact template you want (e.g. an SA-11 instead of "some SAM"). It becomes a permanent defender.
@@ -39,7 +40,8 @@ There is no human to ask. Decide yourself with the tools you have.
   - `jam`: a jammer orbits near an enemy zone; that zone's SAM radars within range hold fire while it lives. BLUE's jammer obeys the same range rule. Escort it and time your SEAD and strikes to its time on station.
   - `move_awacs`: move your AWACS orbit over one of your zones.
   - `supply_airlift`: add supply units to one of your zones at once.
-  - Helicopters and jammers fly real routes and can be shot down; the credits are gone if they are.
+  - Helicopters and jammers fly real routes and can be shot down; the credits are gone if they are. If Foothold refuses an order after you paid (launch denied, no targets in the zone, a helicopter cannot land), the credits are refunded and the ledger says why.
+  - A free-form mission costs its full price every time it is launched, including relaunching it later from `list_capabilities`.
 - **Standing orders**: instant reactions between cycles.
   - `enemy_air_near` scrambles when your radars see enemy aircraft within a radius of a zone.
   - `zone_attacked` fires when one of your zones is attacked.
