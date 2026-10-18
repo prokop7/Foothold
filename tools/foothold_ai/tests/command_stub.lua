@@ -4,7 +4,9 @@
 -- so class-level wrapping is exercised for real. Test-only.
 
 Utils = { getTableSize = function(t) local n = 0 for _ in pairs(t or {}) do n = n + 1 end return n end }
-ShopPrices = { dynamiccap = 500, dynamiccas = 1000, dynamicsead = 500, dynamicbomb = 500, groundattack = 1000 }
+ShopPrices = { dynamiccap = 500, dynamiccas = 1000, dynamicsead = 500, dynamicbomb = 500, groundattack = 1000,
+	zinf = 500, zarm = 1000, zvulcan = 500, zavenger = 1000, zhawk = 2000, zpat = 5000, zhimars = 2500,
+	cruisemsl = 800, jam = 500, zsup3 = 750, capture = 500 }
 function CapAltitude() return 25000 end
 function CasAltitude() return 15000 end
 function SeadAltitude() return 28000 end
@@ -13,7 +15,55 @@ function getBluePlayersCount() return 1 end
 
 local zonePoints = {}
 CustomZone = {}
-function CustomZone:getByName(name) return { point = zonePoints[name] } end
+CustomZone.__index = CustomZone
+function CustomZone:getByName(name)
+	if not zonePoints[name] then return nil end
+	return setmetatable({ name = name, point = zonePoints[name], radius = 2000 }, CustomZone)
+end
+function CustomZone:spawnGroup(template, forceFirst, side, placement, alias)
+	FS.calls[#FS.calls + 1] = { name = 'spawnGroup', args = { template, self.name, alias } }
+	if FS.zoneSpawnFails then return nil end
+	local entry = _DATABASE.Templates.Groups[template]
+	local name = (alias or template) .. '#001'
+	STUB.makeGroup(name, 2, (STUB.countrySide or {})[entry.CountryID] or 2,
+		{ { name = name .. '-1', type = 'T', p = { x = self.point.x, y = 0, z = self.point.z }, air = false } })
+	return { name = name }
+end
+
+-- ME templates the scripts may use (MOOSE _DATABASE), RED country 81.
+local function tpl(name, category, units)
+	local list = {}
+	for i, u in ipairs(units) do list[i] = { name = name .. '-' .. i, type = u[1], attrs = u[2], x = 0, y = 0 } end
+	_DATABASE.Templates.Groups[name] = { CountryID = 81, CategoryID = category, CoalitionID = 1,
+		Template = { name = name, units = list, task = 'Ground Nothing', route = { points = {} } } }
+end
+tpl('Red Armour Group', 2, { { 'T-72B' } })
+tpl('Red SAM SA-11', 2, { { 'SA-11 Buk SR 9S18M1', { ['SAM SR'] = true } } })
+tpl('Red SAM SA-10', 2, { { 'S-300PS 40B6M tr', { ['SAM TR'] = true } } })
+tpl('Red SAM SHORAD SA-8', 2, { { 'Osa 9A33 ln' } })
+tpl('Scuds', 2, { { 'Scud_B' } })
+tpl('Red SAM SA-10 Fixed', 2, { { 'S-300PS 40B6M tr' } })
+tpl('Molniya', 3, { { 'MOLNIYA' } })
+tpl('qeshm-arty-Attack-Group', 2, { { 'Smerch_HE' } })
+tpl('RED_MI8_SUPPLY_KORD', 1, { { 'Mi-8MT' } })
+tpl('CTLD_CARGO_RED_ARTY_Akatsia', 2, { { 'SAU Akatsia' } })
+tpl('Igla', 2, { { 'SA-18 Igla manpad' } })
+tpl('RED_SU25T_CAS', 0, { { 'Su-25T' } })
+tpl('RED_L39_CAS', 0, { { 'L-39C' } })
+CasPlaneTemplate = { 'RED_SU25T_CAS', 'RED_L39_CAS', 'BLUE_A10_CAS' }
+
+function classifyUpgradeName(name)
+	local n = name:lower()
+	if n:find('shorad') then return 'shorad' end
+	if n:find('sam') then return 'sam' end
+	if n:find('armour') then return 'armor' end
+	return 'other'
+end
+
+_awacsFG = {}
+function setAwacsRacetrack(side, coord, heading, leg, zoneName)
+	FS.calls[#FS.calls + 1] = { name = 'setAwacsRacetrack', args = { side, zoneName, heading, leg } }
+end
 
 trigger.action.outTextForCoalition = function(side, text)
 	STUB.coalitionTexts = STUB.coalitionTexts or {}
@@ -31,6 +81,19 @@ ZoneCommanderStub.__index = ZoneCommanderStub
 function ZoneCommanderStub:_regularSupplyUpgradeCount() return 6 end
 function ZoneCommanderStub:canRecieveSupply() return #self.built < 6 end
 function ZoneCommanderStub:_activateFsmGroup(gc) called('_activateFsmGroup', gc.name) end
+function ZoneCommanderStub:addExtraSlot(name)
+	if self.extraUsed then return false end
+	self.extraUsed = name
+	return true
+end
+function ZoneCommanderStub:upgrade(force) called('upgrade', self.zone, force) end
+function ZoneCommanderStub:updateLabel() end
+function ZoneCommanderStub:_regularSupplyHasRouteForSide(side) return true end
+function ZoneCommanderStub:_addExpeditedRegularSupplyStock(amount) called('supplyStock', self.zone, amount) return true end
+function ZoneCommanderStub:startPendingCaptureFromAircraft(side, group)
+	called('startCapture', self.zone, side, group and group:getName())
+	return true, 'started'
+end
 
 local function zone(name, side, x, z, opts)
 	opts = opts or {}
@@ -40,7 +103,9 @@ local function zone(name, side, x, z, opts)
 	return setmetatable({ zone = name, side = side, active = true, isHidden = opts.hidden or false,
 		suspended = false, income = opts.income or 1, facility = opts.facility or 'ground',
 		airbaseName = opts.airbase, isPlaneSpawn = opts.planes or false, isHeloSpawn = opts.helos or false,
-		built = built, groups = {} }, ZoneCommanderStub)
+		built = built, groups = {}, upgrades = { red = { 'Red Armour Group', 'Red SAM SA-11', 'Red SAM SHORAD SA-8',
+			'Scuds', 'Red SAM SA-10 Fixed', 'Molniya' } } },
+		ZoneCommanderStub)
 end
 
 ---------------------------------------------------------------------------
@@ -50,6 +115,14 @@ BattleCommander = {}
 BattleCommander.__index = BattleCommander
 
 function BattleCommander:getZoneByName(name) return self.byName[name] end
+function BattleCommander:getRedZoneUpgradeDirectorInputs(z)
+	return {}, { sam = { 'Red SAM SA-11' }, shorad = { 'Red SAM SHORAD SA-8' } }
+end
+function BattleCommander:fireAtZone(zone, group, precise, amount, perTarget)
+	called('fireAtZone', zone, group, amount, perTarget)
+	return FS.fireError
+end
+function BattleCommander:jamRadarsAtZone(group, zone) called('originalJam', group, zone) end
 function BattleCommander:addFunds(side, amount) self.accounts[side] = math.max(0, self.accounts[side] + amount) end
 function BattleCommander:_getPendingShopReservedCredits(side) return 0 end
 function BattleCommander:_zoneSupportsPlaneSpawn(z) return z.isPlaneSpawn == true end
@@ -237,6 +310,8 @@ FS.shop = { redzoneupgrade = { cost = 1000 }, redwarehouse = { cost = 3000 }, re
 FS.ineligible = { ['red-cas-blocked'] = 'no-warehouse-stock' }
 FS.bc = setmetatable({
 	saveFile = 'foothold_pg_test.lua', accounts = { [1] = 5000, [2] = 2000 }, updateFrequency = 10,
+	rewards = { airplane = 50, helicopter = 50, ground = 10, infantry = 10, sam = 30, ship = 200,
+		['Zone capture'] = 200 },
 	zones = {
 		zone('Red Base', 1, 0, 0, { facility = 'airbase', airbase = 'Bandar', planes = true, helos = true, income = 2 }),
 		zone('Red Front', 1, 20000, 0, { groups = 4 }),

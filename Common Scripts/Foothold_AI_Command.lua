@@ -191,16 +191,221 @@ X.ROLES = {
 	ARTY = { template = 'ArtilleryConvoyLong', mission = 'attack', missionType = 'ARTY', type = 'surface', price = 'groundattack' },
 }
 
+-- A price is a Foothold shop id (that item's ShopPrices price) or a number; x priceScale.
+function X.shopPrice(key)
+	local base = tonumber(key)
+	if not base then
+		base = type(ShopPrices) == 'table' and tonumber(ShopPrices[key]) or nil
+		base = base or tonumber(cfg.fallbackPrices[key]) or 1000
+	end
+	return math.max(0, math.floor(base * (cfg.priceScale or 1)))
+end
+
 function X.priceFor(roleName)
 	local role = X.ROLES[roleName]
-	local shopPrice = role and type(ShopPrices) == 'table' and tonumber(ShopPrices[role.price]) or nil
-	return math.floor((shopPrice or cfg.fallbackPrices[roleName] or 1000) * (cfg.priceScale or 1))
+	return X.shopPrice(role and role.price or 'groundattack')
 end
 
 local function availableCredits(side)
 	local b = bcObj()
 	local reserved = b._getPendingShopReservedCredits and b:_getPendingShopReservedCredits(side) or 0
 	return (tonumber(b.accounts[side]) or 0) - reserved
+end
+
+---------------------------------------------------------------------------
+-- Economy: each side has one Foothold account (bc.accounts). Claude's orders
+-- are paid from it; RED earns like a player team (zone income, kills, captures).
+---------------------------------------------------------------------------
+
+local econ = cfg.economy or {}
+X.ledger = { red = {}, blue = {} }
+X.flow = { red = { spent = 0, earned = 0 }, blue = { spent = 0, earned = 0 } }
+X.lastCredits = {}
+X.unpaidKills = {}   -- [unitName] = { side, amount, kills }: air kills, paid on landing
+
+function X.book(side, amount, what)
+	local sideName = SIDE_NAME[side]
+	if not X.ledger[sideName] or amount == 0 then return end
+	pushLimited(X.ledger[sideName], { minute = round(timer.getAbsTime() / 60), amount = round(amount), what = what },
+		econ.ledgerSize or 25)
+	local f = X.flow[sideName]
+	if amount < 0 then f.spent = f.spent - amount else f.earned = f.earned + amount end
+end
+
+-- nil when the side can pay, else the reason it cannot.
+function X.needCredits(side, price)
+	if availableCredits(side) < price then
+		return string.format('not enough credits (need %d, have %d)', price, round(availableCredits(side)))
+	end
+	return nil
+end
+
+function X.charge(side, amount, what)
+	amount = math.max(0, math.floor(tonumber(amount) or 0))
+	if amount == 0 then return end
+	bcObj():addFunds(side, -amount)
+	X.book(side, -amount, what)
+end
+
+function X.credit(side, amount, what)
+	amount = math.floor(tonumber(amount) or 0)
+	if amount <= 0 then return end
+	bcObj():addFunds(side, amount)
+	X.book(side, amount, what)
+end
+
+local function econOn(list, side)
+	return X.controls(side) and type(list) == 'table' and list[SIDE_NAME[side]] == true
+end
+
+-- Same amounts a player gets for the kill (RewardContribution in the setup file).
+local function killReward(target)
+	local r = bcObj().rewards or {}
+	local okCat, cat = pcall(target.getCategory, target)
+	if okCat and Object and Object.Category and cat == Object.Category.STATIC then
+		return tonumber(r.structure) or 100, 'structure'
+	end
+	local okD, desc = pcall(target.getDesc, target)
+	if not okD or type(desc) ~= 'table' then return nil end
+	local c = desc.category
+	if c == 0 then return tonumber(r.airplane) or 50, 'aircraft' end
+	if c == 1 then return tonumber(r.helicopter) or 50, 'helicopter' end
+	if c == 3 then return tonumber(r.ship) or 200, 'ship' end
+	if c == 2 then
+		local function has(a) local ok, v = pcall(target.hasAttribute, target, a) return ok and v end
+		if has('Infantry') then return tonumber(r.infantry) or 10, 'infantry' end
+		if has('SAM elements') or has('SAM SR') or has('SAM TR') then return tonumber(r.sam) or 30, 'SAM' end
+		return tonumber(r.ground) or 10, 'ground unit'
+	end
+	return nil
+end
+
+local function onKill(e)
+	local killer, target = e.initiator, e.target
+	if not (killer and target) then return end
+	local okS, side = pcall(killer.getCoalition, killer)
+	local okT, targetSide = pcall(target.getCoalition, target)
+	if not (okS and okT) or side == targetSide or (targetSide ~= RED and targetSide ~= BLUE) then return end
+	if not econOn(econ.killRewards, side) then return end
+	local okP, player = pcall(killer.getPlayerName, killer)
+	if okP and player then return end   -- players are paid by Foothold
+	local amount, label = killReward(target)
+	if not amount or amount <= 0 then return end
+	amount = math.floor(amount * (econ.rewardScale or 1))
+	local okN, killerName = pcall(killer.getName, killer)
+	local okA, airborne = pcall(killer.inAir, killer)
+	if econ.airKillsPaidOnLanding ~= false and okA and airborne and okN then
+		local u = X.unpaidKills[killerName] or { side = side, amount = 0, kills = 0 }
+		u.amount, u.kills = u.amount + amount, u.kills + 1
+		X.unpaidKills[killerName] = u
+	else
+		X.credit(side, amount, label .. ' destroyed')
+	end
+end
+
+local function settleKills(unitName, landed)
+	local u = X.unpaidKills[unitName]
+	if not u then return end
+	X.unpaidKills[unitName] = nil
+	if landed then
+		X.credit(u.side, u.amount, string.format('%d kills paid on landing (%s)', u.kills, unitName))
+	else
+		X.credit(u.side, math.floor(u.amount * (econ.lostAircraftKeeps or 0)),
+			string.format('%d kills, aircraft lost (%s)', u.kills, unitName))
+	end
+end
+
+local LOST_EVENTS = {}
+for _, k in ipairs({ 'S_EVENT_DEAD', 'S_EVENT_CRASH', 'S_EVENT_PILOT_DEAD', 'S_EVENT_EJECTION', 'S_EVENT_UNIT_LOST' }) do
+	if world.event[k] then LOST_EVENTS[world.event[k]] = true end
+end
+
+world.addEventHandler({ onEvent = function(_, e)
+	if not e or not e.id then return end
+	local ok, err = true, nil
+	if e.id == world.event.S_EVENT_KILL then
+		ok, err = pcall(onKill, e)
+	elseif e.initiator and (e.id == world.event.S_EVENT_LAND or LOST_EVENTS[e.id]) then
+		local okN, name = pcall(e.initiator.getName, e.initiator)
+		if okN and name and X.unpaidKills[name] then
+			ok, err = pcall(settleKills, name, e.id == world.event.S_EVENT_LAND)
+		end
+	end
+	if not ok then FAI.warn('command', 'economy event failed: %s', tostring(err)) end
+end })
+
+local function economyRow(side, b)
+	local sideName = SIDE_NAME[side]
+	local zoneIncome = 0
+	for _, z in ipairs(b.zones) do
+		if z.side == side and z.active and not (z.redIncomeOnly and side ~= RED) then
+			zoneIncome = zoneIncome + (tonumber(z.income) or 0)
+		end
+	end
+	local updateFrequency = math.max(1, tonumber(b.updateFrequency) or 10)
+	local unpaid = 0
+	for _, u in pairs(X.unpaidKills) do if u.side == side then unpaid = unpaid + u.amount end end
+	local credits = round(availableCredits(side))
+	local f = X.flow[sideName]
+	local fee = tonumber((econ.capabilityFee or {})[sideName]) or 0
+	local row = {
+		credits = credits,
+		creditsCap = tonumber(b.creditsCap),
+		incomePerMinute = round(zoneIncome * 60 / updateFrequency + (tonumber((econ.bonusIncomePerMin or {})[sideName]) or 0)),
+		sinceLastSnapshot = {
+			spentOnOrders = round(f.spent), earnedFromCombat = round(f.earned),
+			netChange = X.lastCredits[sideName] and (credits - X.lastCredits[sideName]) or nil,
+		},
+		unpaidAirKills = unpaid > 0 and round(unpaid) or nil,
+		killRewards = econOn(econ.killRewards, side) or nil,
+		capabilityFee = fee > 0 and fee or nil,
+		ledger = FAI.json.array(X.ledger[sideName]),
+	}
+	X.flow[sideName] = { spent = 0, earned = 0 }
+	X.lastCredits[sideName] = credits
+	return row
+end
+
+local function bonusIncomeTick(dt)
+	for side in pairs(X.sides) do
+		local perMin = tonumber((econ.bonusIncomePerMin or {})[SIDE_NAME[side]]) or 0
+		if perMin > 0 then bcObj():addFunds(side, perMin * dt / 60) end
+	end
+end
+
+local CAP_FEE_KEYS = { CAP = 'dynamiccap', CAS = 'dynamiccas', SEAD = 'dynamicsead', RUNWAYSTRIKE = 'dynamicbomb' }
+
+local function capabilityFee(side, role)
+	local frac = tonumber((econ.capabilityFee or {})[SIDE_NAME[side]]) or 0
+	if frac <= 0 then return 0 end
+	return math.floor(X.shopPrice(CAP_FEE_KEYS[role] or 'groundattack') * frac)
+end
+
+-- Template sets (Foothold globals such as CapPlaneTemplate, or dc.SETS) and their sides.
+local function templateSet(key)
+	local g = _G[key]
+	if type(g) == 'table' and type(g[1]) == 'string' then return g end
+	local s = dc and dc.SETS and dc.SETS[key]
+	if type(s) == 'table' and type(s[1]) == 'string' then return s end
+	return nil
+end
+
+function X.templateSide(name)
+	if type(ResolveTemplateSide) == 'function' then
+		local ok, s = pcall(ResolveTemplateSide, name)
+		if ok and (s == RED or s == BLUE) then return s end
+	end
+	local entry = _DATABASE and _DATABASE.Templates and _DATABASE.Templates.Groups[name]
+	return entry and entry.CoalitionID or nil
+end
+
+function X.roleTemplates(roleName, side)
+	local role = X.ROLES[roleName]
+	local out = {}
+	for _, name in ipairs(role and templateSet(role.template) or {}) do
+		if X.templateSide(name) == side then out[#out + 1] = name end
+	end
+	return out
 end
 
 local function findLaunchable(ref)
@@ -257,6 +462,11 @@ function X.launchCapability(side, order)
 	local targetZone = order.targetZone or (cap and cap.targetzone or gc.targetzone)
 	local tz = b:getZoneByName(targetZone)
 	if not tz or not tz.active or tz.isHidden then return false, 'unknown target zone' end
+	local fee = order.freeform and 0 or capabilityFee(side, cap and cap.MissionType or gc.MissionType)
+	if fee > 0 then
+		local short = X.needCredits(side, fee)
+		if short then return false, short end
+	end
 	local now = timer.getAbsTime()
 	if cap then
 		local request = { targetZone = targetZone }
@@ -285,8 +495,13 @@ function X.launchCapability(side, order)
 		X.authorized[gc.name] = nil
 		return false, 'group not ready (state ' .. tostring(gc.state) .. ')'
 	end
-	trackMission(side, order, gc)
-	return true, string.format('%s from %s to %s', gc.name, origin.zone, targetZone)
+	local m = trackMission(side, order, gc)
+	if fee > 0 then
+		X.charge(side, fee, 'sortie ' .. gc.name)
+		m.cost = fee
+	end
+	return true, string.format('%s from %s to %s%s', gc.name, origin.zone, targetZone,
+		fee > 0 and string.format(' (fee %d)', fee) or '')
 end
 
 local function sanitizeId(s) return (tostring(s):gsub('[^%w]+', '_')) end
@@ -349,16 +564,25 @@ function X.launchMission(side, order)
 	if not b:_templateSetSupportsSide(role.template, side) then
 		return false, 'no ' .. order.role .. ' aircraft/vehicles configured for this side'
 	end
-	local price = X.priceFor(order.role)
-	if availableCredits(side) < price then
-		return false, string.format('not enough credits (need %d, have %d)', price, round(availableCredits(side)))
+	local template = role.template
+	if order.template ~= nil then
+		local allowed = false
+		for _, name in ipairs(X.roleTemplates(order.role, side)) do
+			if name == order.template then allowed = true break end
+		end
+		if not allowed then return false, 'template ' .. tostring(order.template) .. ' is not a ' .. order.role .. ' template of this side' end
+		template = order.template
 	end
+	local price = X.priceFor(order.role)
+	local short = X.needCredits(side, price)
+	if short then return false, short end
 	local id = string.format('FAI-%s-%s-%s-%s', SIDE_NAME[side], sanitizeId(origin.zone), sanitizeId(target.zone), order.role)
+	if template ~= role.template then id = id .. '-' .. sanitizeId(template) end
 	local spec = X.freeformSpecs[id]
 	if not spec then
 		local altFn = role.alt and _G[role.alt]
 		spec = { id = id, origin = origin.zone, target = target.zone, mission = role.mission,
-			missionType = role.missionType, template = role.template, type = role.type,
+			missionType = role.missionType, template = template, type = role.type,
 			altitude = type(altFn) == 'function' and altFn() or nil, role = order.role }
 	end
 	local cap, err = registerFreeform(spec)
@@ -367,9 +591,9 @@ function X.launchMission(side, order)
 		X.freeformSpecs[id] = spec
 		saveFreeformSpecs()
 	end
-	local launched, detail = X.launchCapability(side, { id = order.id, capability = id, source = order.source })
+	local launched, detail = X.launchCapability(side, { id = order.id, capability = id, source = order.source, freeform = true })
 	if not launched then return false, detail end
-	b:addFunds(side, -price)
+	X.charge(side, price, string.format('%s %s -> %s', order.role, origin.zone, target.zone))
 	if X.missions[order.id] then X.missions[order.id].cost = price end
 	return true, detail .. string.format(' (cost %d)', price)
 end
@@ -440,6 +664,7 @@ function X.purchase(side, order)
 	X.upgradeRequest = nil
 	if not ok then return false, 'purchase error: ' .. tostring(purchased) end
 	if not purchased then return false, failure or 'purchase refused (credits, cooldown or no valid placement)' end
+	X.book(side, -(tonumber(cost) or tonumber(shopItem.cost) or 0), 'purchase ' .. action .. ' ' .. tostring(where or ''))
 	return true, string.format('%s at %s for %s', action, tostring(where or order.zone or ''), tostring(cost or shopItem.cost))
 end
 
@@ -526,6 +751,12 @@ local executors = {
 		return X.setStandingOrders(SIDE_NAME[side], order.rules)
 	end,
 }
+
+X.executors = executors
+X.snapshotExtensions = {}
+X.util = { bcObj = bcObj, round = round, zonePoint = zonePoint, zoneUsable = zoneUsable, wrap = wrap,
+	sanitizeId = sanitizeId, availableCredits = availableCredits, pushLimited = pushLimited,
+	SIDE_NAME = SIDE_NAME, SIDE_ID = SIDE_ID }
 
 function X.execute(side, order)
 	local fn = executors[order.type]
@@ -746,6 +977,11 @@ wrap(Director, 'Director', 'recordZoneOwnershipChange', function(original, self,
 			X.eventPending[sideName] = true
 			if fromSide == side then onZoneTrigger(sideName, 'zone_lost', zoneName, 'zone lost') end
 		end
+		if econOn(econ.captureReward, toSide) then
+			local r = self.battleCommander and self.battleCommander.rewards or {}
+			X.credit(toSide, math.floor((tonumber(r['Zone capture']) or 200) * (econ.rewardScale or 1)),
+				'captured ' .. tostring(zoneName))
+		end
 	end
 	return changed
 end)
@@ -834,7 +1070,10 @@ local function freeformOptions(b, side)
 	local roles = {}
 	for name, role in pairs(X.ROLES) do
 		if b:_templateSetSupportsSide(role.template, side) then
-			roles[#roles + 1] = { role = name, price = X.priceFor(name), domain = role.type }
+			local templates = X.roleTemplates(name, side)
+			while #templates > 30 do table.remove(templates) end
+			roles[#roles + 1] = { role = name, price = X.priceFor(name), domain = role.type,
+				templates = #templates > 0 and FAI.json.array(templates) or nil }
 		end
 	end
 	table.sort(roles, function(a, c) return a.role < c.role end)
@@ -908,11 +1147,6 @@ local function finishSnapshot(sideName, job)
 	local side = SIDE_ID[sideName]
 	local d = Director:getForSide(side)
 	local b = d.battleCommander
-	local ownIncome = 0
-	for _, z in ipairs(b.zones) do
-		if z.side == side and z.active then ownIncome = ownIncome + (tonumber(z.income) or 0) end
-	end
-	local updateFrequency = math.max(1, tonumber(b.updateFrequency) or 10)
 	local standing = {}
 	for _, r in ipairs(X.standing[sideName]) do
 		standing[#standing + 1] = { id = r.id, trigger = r.trigger, zone = r.zone, fired = r.fired }
@@ -922,10 +1156,7 @@ local function finishSnapshot(sideName, job)
 		campaign = { theatre = env.mission and env.mission.theatre, saveFile = b.saveFile },
 		side = sideName,
 		missionClockMin = round(timer.getAbsTime() / 60),
-		economy = {
-			credits = round(availableCredits(side)),
-			incomePerMinute = round(ownIncome * 60 / updateFrequency),
-		},
+		economy = economyRow(side, b),
 		zones = FAI.json.array(zoneRows(d, b)),
 		capabilities = FAI.json.array(job.rows),
 		freeform = freeformOptions(b, side),
@@ -948,6 +1179,10 @@ local function finishSnapshot(sideName, job)
 		payload.friendlyPlayers = FAI.json.array(players)
 		payload.playerTasking = { designated = X.playerTasks, lastCandidates = X.taskCandidates,
 			roles = FAI.json.array({ 'CAS', 'SEAD', 'DEAD', 'CAPTURE', 'RUNWAYSTRIKE', 'ATTACK_SUPPORT', 'RECON' }) }
+	end
+	for _, extend in ipairs(X.snapshotExtensions) do
+		local ok, err = pcall(extend, sideName, payload, b, d)
+		if not ok then FAI.warn('command', 'snapshot extension failed: %s', tostring(err)) end
 	end
 	local seq = FAI.bridge.writeState(sideName, 'command', payload)
 	X.events[sideName], X.results[sideName] = {}, {}
@@ -1011,6 +1246,7 @@ end)
 
 local function tick()
 	expireAuthorizations()
+	bonusIncomeTick(15)
 	local now = timer.getAbsTime()
 	for side in pairs(X.sides) do
 		local sideName = SIDE_NAME[side]

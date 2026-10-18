@@ -1,5 +1,7 @@
 # RED toolkit for Claude: what BLUE players can do, and what RED could get
 
+> **Status:** waves 1 and 2 are built (batch 3): `Foothold_AI_Ops.lua`, with prices and the economy in [ECONOMY.md](ECONOMY.md). B2 jamming has the range check for both sides. Wave 3 is not built yet.
+
 This compares BLUE's player toolbox (CTLD and shop) with RED's, and proposes new orders that let Claude play RED the way a capable player team would. Everything below is from the code (Persian Gulf mission, `Foothold CTLD.lua`, `Foothold_CTLD_Red.lua`, `foothold pg nya v2.lua`, `zoneCommanderv2.lua`). The line numbers are from the current branch.
 
 ## 1. What BLUE players have today

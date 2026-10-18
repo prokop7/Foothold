@@ -45,7 +45,8 @@ trigger = { action = {
 world = {
 	event = { S_EVENT_BIRTH = 15, S_EVENT_DEAD = 8, S_EVENT_CRASH = 5, S_EVENT_PILOT_DEAD = 9,
 		S_EVENT_EJECTION = 6, S_EVENT_LAND = 4, S_EVENT_PLAYER_LEAVE_UNIT = 21,
-		S_EVENT_MARK_ADDED = 25, S_EVENT_MARK_CHANGE = 26, S_EVENT_MARK_REMOVED = 27 },
+		S_EVENT_MARK_ADDED = 25, S_EVENT_MARK_CHANGE = 26, S_EVENT_MARK_REMOVED = 27,
+		S_EVENT_KILL = 28, S_EVENT_UNIT_LOST = 30 },
 	addEventHandler = function(h) STUB.handlers[#STUB.handlers + 1] = h end,
 }
 function STUB.fire(event)
@@ -60,7 +61,9 @@ AI = {
 Group = { Category = { AIRPLANE = 0, HELICOPTER = 1, GROUND = 2, SHIP = 3 } }
 Airbase = { Category = { AIRDROME = 0, HELIPAD = 1, SHIP = 2 } }
 coalition = { side = { NEUTRAL = 0, RED = 1, BLUE = 2 } }
-land = { getHeight = function() return 10 end }
+land = { getHeight = function() return 10 end, SurfaceType = { LAND = 1, SHALLOW_WATER = 2, WATER = 3, ROAD = 4 },
+	getSurfaceType = function(p) return (STUB.water and STUB.water(p)) and 3 or 1 end }
+Object = { Category = { UNIT = 1, WEAPON = 2, STATIC = 3 } }
 
 -- Units and groups ------------------------------------------------------------
 local Controller = {}
@@ -85,6 +88,12 @@ function UnitMT:getVelocity() return { x = math.cos(self.hdg) * self.spd, y = 0,
 function UnitMT:inAir() return self.air end
 function UnitMT:getFuel() return 0.8 end
 function UnitMT:getAmmo() return { { count = 2, desc = { displayName = 'AIM-9M' } } } end
+function UnitMT:getCoalition() return self.group.side end
+function UnitMT:getCategory() return Object.Category.UNIT end
+function UnitMT:getDesc() return { category = self.descCategory or (self.group.category == 1 and 1 or self.group.category) } end
+function UnitMT:hasAttribute(a) return self.attrs ~= nil and self.attrs[a] == true end
+function UnitMT:getLife() return self.alive and 1 or 0 end
+function UnitMT:getController() return self.controller end
 
 local GroupMT = {}
 GroupMT.__index = GroupMT
@@ -106,7 +115,9 @@ function STUB.makeGroup(name, category, side, unitDefs)
 		controller = setmetatable({ history = {}, options = {}, commands = {} }, Controller) }, GroupMT)
 	for i, d in ipairs(unitDefs) do
 		local u = setmetatable({ name = d.name, type = d.type, player = d.player, group = g, alive = true,
-			p = d.p, hdg = d.hdg or 0, spd = d.spd or 150, air = d.air ~= false }, UnitMT)
+			p = d.p, hdg = d.hdg or 0, spd = d.spd or 150, air = d.air ~= false, attrs = d.attrs,
+			descCategory = d.descCategory,
+			controller = setmetatable({ history = {}, options = {}, commands = {} }, Controller) }, UnitMT)
 		g.units[i] = u
 		STUB.units[u.name] = u
 	end
@@ -129,8 +140,9 @@ coalition.addGroup = function(countryId, categoryId, data)
 	for i, u in ipairs(data.units) do
 		defs[i] = { name = u.name, type = u.type, p = { x = u.x, y = u.alt, z = u.y }, hdg = u.heading, spd = u.speed }
 	end
-	return STUB.makeGroup(data.name, categoryId, 2, defs)
+	return STUB.makeGroup(data.name, categoryId, (STUB.countrySide or {})[countryId] or 2, defs)
 end
+STUB.countrySide = { [81] = 1, [0] = 1 }
 local airbases = {}
 function STUB.addAirbase(name, side, category, p)
 	airbases[#airbases + 1] = { side = side, name = name,
@@ -145,6 +157,26 @@ coalition.getAirbases = function(side)
 end
 
 -- MOOSE ------------------------------------------------------------------------
+STUB.spawns = {}
+SPAWN = {}
+SPAWN.__index = SPAWN
+function SPAWN:NewWithAlias(template, alias)
+	return setmetatable({ template = template, alias = alias }, SPAWN)
+end
+function SPAWN:InitValidateAndRepositionGroundUnits() return self end
+function SPAWN:SpawnFromVec2(v)
+	local entry = _DATABASE.Templates.Groups[self.template]
+	if not entry or STUB.failSpawn then return nil end
+	local name = self.alias .. '#001'
+	local side = (STUB.countrySide or {})[entry.CountryID] or 2
+	local defs = {}
+	for i, u in ipairs(entry.Template.units) do
+		defs[i] = { name = name .. '-' .. i, type = u.type, p = { x = v.x, y = 0, z = v.y }, air = false, attrs = u.attrs }
+	end
+	STUB.makeGroup(name, entry.CategoryID or 2, side, defs)
+	STUB.spawns[#STUB.spawns + 1] = { template = self.template, name = name, x = v.x, z = v.y }
+	return { GetName = function() return name end }
+end
 _DATABASE = { Templates = { Groups = {}, Units = {} }, nextStn = 100 }
 function _DATABASE:GetNextSTN(octal, unitName)
 	self.nextStn = self.nextStn + 1

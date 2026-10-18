@@ -67,10 +67,72 @@ FAI.defaults = {
 		authorizationTimeoutSec = 1200, -- an authorized group that never launched is released
 		standingTickSec = 10,
 		maxStandingOrders = 12,
-		priceScale = 1,           -- free-form mission prices = Foothold shop price x priceScale
-		fallbackPrices = { CAP = 500, SWEEP = 500, CAS = 1000, CAS_HELO = 1000, SEAD = 500,
-			RUNWAY_STRIKE = 500, CONVOY = 1000, ARTY = 1000 },
+		priceScale = 1,           -- every price = Foothold shop price x priceScale
+		-- Used when the mission's ShopPrices lacks an item (keys are Foothold shop ids).
+		fallbackPrices = { dynamiccap = 500, dynamiccas = 1000, dynamicsead = 500, dynamicbomb = 500,
+			groundattack = 1000, zinf = 500, zarm = 1000, zvulcan = 500, zgepard = 750, zavenger = 1000,
+			zhawk = 2000, zpat = 5000, zhimars = 2500, cruisemsl = 800, jam = 500, zsup3 = 750,
+			capture = 500, intel = 150 },
 		supplyBonus = { high = 400, normal = 0, low = -300 },
+		-- Credits. Every order below draws on the side's Foothold account (bc.accounts).
+		economy = {
+			-- Fee for launching Foothold's pre-built capabilities, as a fraction of the role's
+			-- shop price. 0 = free, as under Foothold's own commander (they still use aircraft/warehouse stock).
+			capabilityFee = { red = 0, blue = 0 },
+			-- AI kills earn the same credits a player earns for that kill (RewardContribution).
+			-- BLUE players already earn through Foothold, so this is off for BLUE by default.
+			killRewards = { red = true, blue = false },
+			rewardScale = 1,
+			-- Like a player's: an aircraft's kills are paid when it lands; if it is lost first,
+			-- only this fraction is paid (a player who ejects keeps 25 %).
+			airKillsPaidOnLanding = true,
+			lostAircraftKeeps = 0.25,
+			captureReward = { red = true, blue = false },  -- RewardContribution['Zone capture']
+			bonusIncomePerMin = { red = 0, blue = 0 },     -- flat extra income on top of zone income
+			ledgerSize = 25,
+		},
+		-- Prices of the RED operations (Foothold shop id = that item's price, or a number).
+		prices = {
+			deploy = { ground = 'zinf', armor = 'zarm', aaa = 'zvulcan', shorad = 'zavenger',
+				sam = 'zhawk', sam_long = 'zpat', arty = 'zhimars', other = 'zarm' },
+			airlift = 'zsup3',          -- per 3 supply units
+			heli_raid = 'groundattack',
+			air_assault = 'capture',
+			ambush = 'zvulcan',
+			jam = 'jam',
+			awacs = 0,
+		},
+		ops = {
+			deployMaxPerZone = 2,       -- extra groups placed by deploy_forces, per zone
+			deployMaxTotal = 12,
+			-- Long-range fire: a battery is set up inside a RED zone, fires, and stays there
+			-- (a real target) for lifetimeSec. range in km; eras = Foothold Era values (nil = all).
+			fireSystems = {
+				scud = { templates = { 'Scuds' }, rangeKm = 280, salvo = 1, price = 'cruisemsl', cooldownSec = 1800, lifetimeSec = 1200 },
+				iskander = { templates = { 'Khasab-Forces-attack' }, rangeKm = 450, salvo = 4, price = 'cruisemsl',
+					cooldownSec = 1800, lifetimeSec = 1200, eras = { Modern = true } },
+				smerch = { templates = { 'qeshm-arty-Attack-Group' }, rangeKm = 65, salvo = 12, price = 'zhimars',
+					cooldownSec = 1200, lifetimeSec = 1200, eras = { Modern = true, Coldwar = true } },
+			},
+			fireSetupSec = 60,          -- from setting up to firing
+			transportTemplates = { 'RED_MI8_SUPPLY_KORD', 'Bandar-force-1' },
+			raidGuns = { nona = { template = 'CTLD_CARGO_RED_ARTY_Nona', rangeKm = 8 },
+				akatsia = { template = 'CTLD_CARGO_RED_ARTY_Akatsia', rangeKm = 17 } },
+			raidRounds = 12,
+			raidGunLifetimeSec = 1800,
+			ambushTeams = { manpads = 'Igla', manpads_s = 'Igla-S', zu23 = 'Red SAM AAA 9' },
+			ambushLifetimeSec = 3600,
+			ambushMaxActive = 4,
+			helo = { altitudeM = 150, speedKmh = 220, cruiseMaxKm = 150, timeoutSec = 2400 },
+			airliftUnits = 3,
+			-- Jamming, both sides: only SAM radars within rangeNm of a live jammer are jammed,
+			-- and the jammer is sent to orbit standoffNm from the target zone.
+			-- RED jammer: the first template found. Add a late-activated RED group named
+			-- ewAircraftRed in the Mission Editor for a dedicated jammer; AN-30M stands in until then.
+			jamming = { rangeNm = 40, standoffNm = 25, durationSec = 1800, altitudeFt = 22000,
+				routeJammers = true, templates = { red = { 'ewAircraftRed', 'AN-30M' } } },
+			maxActiveFlights = 6,       -- RED helicopter/jammer operations at once
+		},
 	},
 }
 

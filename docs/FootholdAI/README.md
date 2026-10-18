@@ -3,7 +3,9 @@
 Batch 1 contains the foundation (the mission ↔ Claude bridge) and the AI wingman.
 Batch 2 puts Claude **in command** of RED and BLUE: Foothold's own AI commander is off for those sides,
 and Claude plans every few minutes through game tools while its standing orders handle instant reactions.
-The overall plan is in [PLAN.md](PLAN.md).
+Batch 3 adds the credit economy and RED's player-like operations (deploy forces, exact upgrades, fire missions,
+helicopter raids, air assault, ambushes, jamming, AWACS, airlift).
+The overall plan is in [PLAN.md](PLAN.md); credits and prices are explained in [ECONOMY.md](ECONOMY.md).
 
 ## Files
 
@@ -11,7 +13,8 @@ The overall plan is in [PLAN.md](PLAN.md).
 |---|---|
 | `Common Scripts/Foothold_AI_Core.lua` | Config, logging, the mailbox shared with the sidecar, and the link test |
 | `Common Scripts/Foothold_AI_Wingman.lua` | F10 "AI Wingman" menu |
-| `Common Scripts/Foothold_AI_Command.lua` | Takeover of Foothold's AI decisions, order executor, standing orders, snapshots |
+| `Common Scripts/Foothold_AI_Command.lua` | Takeover of Foothold's AI decisions, order executor, standing orders, snapshots, credits |
+| `Common Scripts/Foothold_AI_Ops.lua` | RED operations and the range-checked jamming for both sides |
 | `tools/foothold_ai/agent.py` | Runs one Claude planning cycle per side (memory, personality, logs) |
 | `tools/foothold_ai/mcp_server.py` | The game tools Claude uses (query the situation, issue orders) |
 | `tools/foothold_ai/prompts/command_*.md` | System prompts for the RED commander and BLUE HQ (edit freely) |
@@ -115,10 +118,42 @@ Re-patch the mission first (the commander file changed). The sidecar must be run
 **Settings** (`FootholdAI_Config.lua`, under `command = { ... }`): `sides` (`{ 'red', 'blue' }`, or one side only), `cycleSec` (300), `eventMinGapSec` (90), `priceScale` (1), `maxStandingOrders` (12).
 To change a campaign's personality, edit or delete its `memory_*_<side>.json` file.
 
+## Test batch 3 checklist (credits and RED operations)
+
+Re-patch the mission (a new file, `Foothold_AI_Ops.lua`, is added to the trigger).
+
+**Start**
+- [ ] `dcs.log`: `[FootholdAI][ops] RED operations ready (jammer: AN-30M)` (or `ewAircraftRed` if you added one, see [ECONOMY.md](ECONOMY.md)).
+
+**Credits**
+- [ ] `command_red.log` / `cycles\red_state.json`: `economy` shows credits, income per minute and a `ledger`.
+- [ ] Kill a few things with RED AI (or let it kill you): ground kills appear in the ledger at once; a RED fighter's kills appear when it lands (`kills paid on landing`).
+- [ ] RED orders that cost credits are refused with `not enough credits` when RED is broke.
+
+**Operations.** For each one RED Claude orders, note whether it looked right in the game:
+- [ ] `deploy_forces`: an extra group appears inside the RED zone. Restart the mission: it is still there (`restored N deployed RED groups`).
+- [ ] `upgrade_zone`: the zone gets that exact template (e.g. an SA-11), with the usual "reinforced" message.
+- [ ] `fire_mission`: a launcher battery appears in the origin zone and fires about 1 min later (`fire_mission ... fired` in the next snapshot's events). **Check the missiles reach**: the snapshot ranges are my estimates.
+- [ ] `heli_raid`: a Mi-8 flies out, lands short of a BLUE zone, unloads a gun that shells the zone, then flies home and disappears on landing.
+- [ ] `air_assault`: a Mi-8 lands troops in a neutral zone and the capture countdown starts.
+- [ ] `ambush`: a Mi-8 drops an Igla or ZU-23 team between two zones.
+- [ ] `jam`: the jammer flies to an orbit about 25 nm from the BLUE zone. Only radars within 40 nm stop firing; shooting it down restores them within 10 s.
+- [ ] BLUE shop jammer (if your mission sells it): the jammer now flies toward the target zone, and only jams within 40 nm.
+- [ ] `move_awacs`: the RED AWACS moves and stays there after zone captures.
+
+**Send back** the same files as batch 2, plus `ops_*.lua` from the exchange folder.
+
 ## Known limitations (batch 1)
 - Menu text is English only. Foothold's localization will be added once the feature set settles.
 - Wingmen carry the slot's default loadout from the Mission Editor, not what you rearmed to.
 - Dismiss removes the aircraft instantly.
+
+## Known limitations (batch 3)
+- Fire-mission and raid-gun ranges are estimates (Scud 280 km, Iskander 450 km, Smerch 65 km, 2S9 Nona 8 km, 2S3 Akatsia 17 km); tune them in `command.ops` after testing.
+- Deployed forces fight but do not count as zone defenders for capture; `upgrade_zone` is the permanent option.
+- Helicopters air-start over their origin zone (no ground start or parking) and are removed when they land back home.
+- A gun or ambush team left behind is removed after 30 / 60 minutes (treated as extracted).
+- Only `deploy_forces` survives a mission restart; flights, batteries and teams in progress are lost on restart.
 
 ## Known limitations (batch 2)
 - Claude sets timing with launch delays. Foothold flights have no shared push point yet (phase 4), so arrival times can drift with start-up and taxi.

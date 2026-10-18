@@ -71,6 +71,14 @@ Exchange folder: <Saved Games>\DCS\Missions\Saves\FootholdAI\                   
 | `trigger_event` (RED) | `evc` scripted events |
 | `hq_message` (BLUE) | coalition text |
 | `standing_orders` | Lua rules: `enemy_air_near` (EWRS radar contacts), `zone_attacked` (AIEN reports, RED), `zone_lost`; with cooldown, max active, and `$zone` substitution |
+| `deploy_forces` (RED) | `CustomZone:spawnGroup` with the mission's own RED zone templates; saved to `ops_*.lua` and respawned at start |
+| `upgrade_zone` (RED) | `zone:addExtraSlot(template)` + `zone:upgrade(true)`, the same steps as Foothold's RED zone upgrade |
+| `fire_mission` (RED) | Launcher template spawned in the origin zone, then `bc:fireAtZone` |
+| `heli_raid`, `air_assault`, `ambush` (RED) | Mi-8 flight with a Land task; on landing: gun + `bc:fireAtZone`, `zone:startPendingCaptureFromAircraft(RED, ...)`, or a MANPADS/AAA team |
+| `jam` (RED) | Jammer flight + `bc:jamRadarsAtZone`, which now range-checks for both sides |
+| `move_awacs`, `supply_airlift` (RED) | `setAwacsRacetrack` (Claude's station kept over Foothold's re-positioning); `zone:_addExpeditedRegularSupplyStock` |
+
+Every order is paid from the side's Foothold account; RED earns from zones, kills and captures. See [ECONOMY.md](ECONOMY.md).
 
 Denied launches (e.g. runway blocked, origin lost) are cleaned up like the Director's own denials and reported to Claude.
 
@@ -81,7 +89,8 @@ Denied launches (e.g. runway blocked, origin lost) are cleaned up like the Direc
 | 0 | Foundation: core, bridge, patcher, link test | done (batch 1) |
 | 1 | AI wingman | done (batch 1) |
 | 2 | ~~Bias commander~~ replaced by **Claude command mode** (above) | done (batch 2) |
-| 3 | RED player-like actions: extra armor/AAA anywhere, RED FARPs, heli-borne artillery raids, ambushes, as new order types | next |
+| 3 | Credit economy and RED player-like operations (waves 1 and 2 of [RED_TOOLKIT.md](RED_TOOLKIT.md)) | done (batch 3) |
+| 3b | Wave 3: recon → intel, hunting BLUE FARPs and CTLD sites, RED forward FARPs | planned |
 | 4 | Package timing in Lua: IP hold and push time, so packages hit together regardless of start-up delays (today Claude times with `delaySec`) | planned |
 | 5 | Player joins AI packages; natural-language wingman | planned |
 

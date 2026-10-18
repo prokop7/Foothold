@@ -26,6 +26,8 @@ UPGRADE_CATEGORIES = ["sam", "shorad", "aaa", "armor", "ground", "arty"]
 PURCHASE_ITEMS = ["upgrade", "warehouse", "warehouse_repair", "mass_attack", "bomber"]
 PLAYER_TASK_ROLES = ["CAS", "SEAD", "DEAD", "CAPTURE", "RUNWAYSTRIKE", "ATTACK_SUPPORT", "RECON"]
 TRIGGERS = ["enemy_air_near", "zone_attacked", "zone_lost"]
+# Pre-built capability role -> free-form role whose price the capability fee is based on.
+FEE_ROLE = {"CAP": "CAP", "CAS": "CAS", "SEAD": "SEAD", "RUNWAYSTRIKE": "RUNWAY_STRIKE"}
 
 
 class GameTools:
@@ -48,6 +50,9 @@ class GameTools:
         ff = self.p.get("freeform") or {}
         self.roles = {r["role"]: r for r in ff.get("roles", [])}
         self.air_origins = {o["zone"]: o for o in ff.get("airOrigins", [])}
+        self.ops = self.p.get("operations") or {}
+        self.deploy_queued: dict[str, int] = {}
+        self.ops_queued: set[str] = set()
         self.save()
 
     # -- helpers ---------------------------------------------------------
@@ -80,6 +85,29 @@ class GameTools:
         self.save()
         when = f" in {order['delaySec'] // 60} min" if order.get("delaySec") else " now"
         return f"queued {order['id']}: {order['type']}{when}"
+
+    def spend(self, price: int, what: str):
+        price = int(price or 0)
+        if self.spent + price > self.credits:
+            raise ValueError(f"not enough credits: {self.credits - self.spent} left this cycle, {what} costs {price}")
+        self.spent += price
+
+    def cap_fee(self, c: dict) -> int:
+        frac = (self.p.get("economy") or {}).get("capabilityFee") or 0
+        if not frac or c.get("mission") == "supply":
+            return 0
+        role = self.roles.get(FEE_ROLE.get(c.get("role"), "CONVOY")) or {}
+        return int((role.get("price") or 1000) * frac)
+
+    def red_only(self, what: str):
+        if self.side != "red":
+            raise ValueError(f"{what} is RED only")
+        if not self.ops:
+            raise ValueError("RED operations are not loaded in this mission (Foothold_AI_Ops.lua)")
+
+    def zone_km(self, a: str, b: str) -> float | None:
+        d = self.dist_nm(a, b)
+        return None if d is None else d * 1.852
 
     def cap_row(self, c: dict) -> dict:
         row = {k: c.get(k) for k in ("id", "origin", "target", "role", "mission", "domain")}
@@ -130,6 +158,8 @@ class GameTools:
         if self.side == "red":
             out["purchases"] = p.get("purchases")
             out["scriptedEvents"] = p.get("scriptedEvents")
+            ops = p.get("operations") or {}
+            out["operationsInProgress"] = {k: ops.get(k) for k in ("flights", "groundTeams", "batteries", "deployed")}
         else:
             out["friendlyPlayers"] = p.get("friendlyPlayers")
             out["playerTasking"] = p.get("playerTasking")
@@ -194,6 +224,10 @@ class GameTools:
     def get_player_tasking(self):
         return self.p.get("playerTasking")
 
+    def list_operations(self):
+        self.red_only("operations")
+        return self.ops
+
     # -- order tools -----------------------------------------------------
     def launch_capability(self, capability, target_zone=None, delay_min=0):
         c = self.caps.get(capability)
@@ -215,12 +249,15 @@ class GameTools:
                 raise ValueError(f"role {c.get('role')} cannot be sent to another target; "
                                  "use launch_mission for a free-form mission")
             order["targetZone"] = target_zone
+        fee = self.cap_fee(c)
+        if fee:
+            self.spend(fee, f"the sortie fee for {capability}")
         self.queued_caps.add(capability)
         target = order.get("targetZone", c["target"])
         eta = self.eta_min(c["origin"], target, "surface" if c.get("domain") == "surface" else "air")
         return self.add_order(order, delay_min) + f" ({c['origin']} -> {target}, about {eta} min flight)"
 
-    def launch_mission(self, origin, role, target_zone, delay_min=0):
+    def launch_mission(self, origin, role, target_zone, delay_min=0, template=None):
         r = self.roles.get(role)
         if not r:
             raise ValueError(f"role {role!r} not available for this side; options: {sorted(self.roles)}")
@@ -234,14 +271,16 @@ class GameTools:
             raise ValueError(f"{origin} cannot launch helicopters")
         if role != "CAS_HELO" and r.get("domain") == "air" and not self.air_origins[origin].get("planes"):
             raise ValueError(f"{origin} cannot launch planes")
+        if template is not None and template not in (r.get("templates") or []):
+            raise ValueError(f"template {template!r} is not a {role} template; options: {r.get('templates') or []}")
         price = int(r.get("price", 0))
-        if self.spent + price > self.credits:
-            raise ValueError(f"not enough credits: {self.credits - self.spent} left this cycle, mission costs {price}")
-        self.spent += price
+        self.spend(price, "the mission")
         eta = self.eta_min(origin, target_zone, "surface" if r.get("domain") == "surface" else
                            ("helicopter" if role == "CAS_HELO" else "air"))
-        return self.add_order({"type": "launch_mission", "origin": origin, "role": role,
-                               "targetZone": target_zone}, delay_min) + \
+        order = {"type": "launch_mission", "origin": origin, "role": role, "targetZone": target_zone}
+        if template is not None:
+            order["template"] = template
+        return self.add_order(order, delay_min) + \
             f" (cost {price}, about {eta} min to target; the mission re-checks aircraft and stock at launch)"
 
     def purchase(self, item, zone=None, category=None, targets=None):
@@ -347,6 +386,155 @@ class GameTools:
             raise ValueError("HQ messages are BLUE only")
         return self.add_order({"type": "hq_message", "text": str(text)[:400]}, 0)
 
+    # -- RED operations ----------------------------------------------------
+    def deploy_forces(self, zone, template):
+        self.red_only("deploy_forces")
+        if not self.own(zone):
+            raise ValueError(f"{zone!r} is not one of your zones")
+        entry = next((e for e in self.ops.get("deployCatalog", []) if e["template"] == template), None)
+        if not entry:
+            raise ValueError("unknown template; see list_operations deployCatalog")
+        limits = self.ops.get("deployLimits") or {}
+        in_zone = sum(1 for d in self.ops.get("deployed", []) if d["zone"] == zone) + self.deploy_queued.get(zone, 0)
+        total = len(self.ops.get("deployed", [])) + sum(self.deploy_queued.values())
+        if in_zone >= limits.get("perZone", 2):
+            raise ValueError(f"{zone} already has {in_zone} deployed groups (limit {limits.get('perZone')})")
+        if total >= limits.get("total", 12):
+            raise ValueError("deployed group limit reached")
+        price = (self.ops.get("prices") or {}).get("deploy", {}).get(entry["category"], 0)
+        self.spend(price, template)
+        self.deploy_queued[zone] = self.deploy_queued.get(zone, 0) + 1
+        return self.add_order({"type": "deploy_forces", "zone": zone, "template": template}, 0) + \
+            f" ({entry['category']}, cost {price})"
+
+    def upgrade_zone(self, zone, template):
+        self.red_only("upgrade_zone")
+        slot = next((s for s in self.ops.get("upgradeSlots", []) if s["zone"] == zone), None)
+        if not slot:
+            raise ValueError(f"{zone} has no free upgrade slot; zones with one: "
+                             f"{[s['zone'] for s in self.ops.get('upgradeSlots', [])]}")
+        category = next((c for c, names in slot["templates"].items() if template in names), None)
+        if not category:
+            raise ValueError(f"{zone} does not take {template!r}; options: {slot['templates']}")
+        if ("upgrade", zone) in self.ops_queued:
+            raise ValueError(f"{zone} is already being upgraded this cycle")
+        deploy_prices = (self.ops.get("prices") or {}).get("deploy", {})
+        price = deploy_prices.get(category, deploy_prices.get("other", 0))
+        if category == "sam" and any(k in template.lower() for k in ("sa-10", "sa-5", "sa-12", "sa-20", "s-300")):
+            price = deploy_prices.get("sam_long", price)
+        self.spend(price, template)
+        self.ops_queued.add(("upgrade", zone))
+        return self.add_order({"type": "upgrade_zone", "zone": zone, "template": template}, 0) + \
+            f" ({category}, cost about {price}; permanent defender of {zone})"
+
+    def fire_mission(self, system, origin, target_zone, delay_min=0):
+        self.red_only("fire_mission")
+        sysrow = next((s for s in self.ops.get("fireSystems", []) if s["system"] == system), None)
+        if not sysrow:
+            raise ValueError(f"unknown system; options: {[s['system'] for s in self.ops.get('fireSystems', [])]}")
+        if sysrow.get("readyInMin"):
+            raise ValueError(f"{system} is reloading for {sysrow['readyInMin']} more min")
+        if ("fire", system) in self.ops_queued:
+            raise ValueError(f"{system} is already ordered this cycle")
+        if not self.own(origin):
+            raise ValueError(f"{origin!r} is not one of your zones")
+        z = self.zones.get(target_zone)
+        if not z or z["side"] in (self.side, "neutral"):
+            raise ValueError("target must be an enemy zone")
+        km = self.zone_km(origin, target_zone)
+        if km is not None and km > sysrow["rangeKm"]:
+            raise ValueError(f"{target_zone} is {round(km)} km from {origin}; {system} reaches {sysrow['rangeKm']} km")
+        self.spend(sysrow["price"], f"a {system} fire mission")
+        self.ops_queued.add(("fire", system))
+        return self.add_order({"type": "fire_mission", "system": system, "origin": origin,
+                               "targetZone": target_zone}, delay_min) + \
+            f" (cost {sysrow['price']}; the battery sets up in {origin}, fires about 1 min later and stays " \
+            "there as a target for a while)"
+
+    def move_awacs(self, zone, heading_deg=0, leg_nm=20):
+        self.red_only("move_awacs")
+        if not (self.ops.get("awacs") or {}).get("available"):
+            raise ValueError("no RED AWACS in this mission")
+        if not self.own(zone):
+            raise ValueError("the AWACS orbits over your own zones")
+        price = (self.ops.get("prices") or {}).get("awacs", 0)
+        self.spend(price, "moving the AWACS")
+        return self.add_order({"type": "move_awacs", "zone": zone, "headingDeg": heading_deg, "legNm": leg_nm}, 0)
+
+    def supply_airlift(self, zone):
+        self.red_only("supply_airlift")
+        if not self.own(zone):
+            raise ValueError(f"{zone!r} is not one of your zones")
+        price = (self.ops.get("prices") or {}).get("airlift", 0)
+        self.spend(price, "the airlift")
+        return self.add_order({"type": "supply_airlift", "zone": zone}, 0) + \
+            f" (cost {price}, adds {self.ops.get('airliftUnits', 3)} supply units)"
+
+    def _helo_origin(self, origin, target):
+        if origin not in (self.ops.get("heloOrigins") or []):
+            raise ValueError(f"{origin!r} cannot launch helicopters; options: {self.ops.get('heloOrigins')}")
+        km = self.zone_km(origin, target)
+        limit = self.ops.get("heloRangeKm", 150)
+        if km is not None and km > limit + 10:
+            raise ValueError(f"{target} is {round(km)} km from {origin}; helicopter operations reach {limit} km")
+
+    def heli_raid(self, origin, target_zone, gun="akatsia", delay_min=0):
+        self.red_only("heli_raid")
+        guns = {g["gun"]: g for g in self.ops.get("raidGuns", [])}
+        if gun not in guns:
+            raise ValueError(f"gun must be one of {sorted(guns)}")
+        z = self.zones.get(target_zone)
+        if not z or z["side"] in (self.side, "neutral"):
+            raise ValueError("target must be an enemy zone")
+        self._helo_origin(origin, target_zone)
+        price = (self.ops.get("prices") or {}).get("heli_raid", 0)
+        self.spend(price, "the raid")
+        return self.add_order({"type": "heli_raid", "origin": origin, "targetZone": target_zone, "gun": gun},
+                              delay_min) + \
+            f" (cost {price}; a Mi-8 lands the gun about {round(guns[gun]['rangeKm'] * 0.8)} km from {target_zone}" \
+            " on your side, the gun fires, the helicopter flies home)"
+
+    def air_assault(self, origin, target_zone, delay_min=0):
+        self.red_only("air_assault")
+        z = self.zones.get(target_zone)
+        if not z or z["side"] != "neutral":
+            raise ValueError("air assault needs a neutral zone")
+        self._helo_origin(origin, target_zone)
+        price = (self.ops.get("prices") or {}).get("air_assault", 0)
+        self.spend(price, "the air assault")
+        return self.add_order({"type": "air_assault", "origin": origin, "targetZone": target_zone}, delay_min) + \
+            f" (cost {price}; the troops capture the zone if they survive the capture time)"
+
+    def ambush(self, origin, from_zone, toward_zone, fraction=0.5, team="manpads", delay_min=0):
+        self.red_only("ambush")
+        if team not in (self.ops.get("ambushTeams") or []):
+            raise ValueError(f"team must be one of {self.ops.get('ambushTeams')}")
+        if from_zone not in self.zones or toward_zone not in self.zones:
+            raise ValueError("from_zone and toward_zone must be known zones")
+        self._helo_origin(origin, from_zone)
+        price = (self.ops.get("prices") or {}).get("ambush", 0)
+        self.spend(price, "the ambush team")
+        return self.add_order({"type": "ambush", "origin": origin, "fromZone": from_zone, "towardZone": toward_zone,
+                               "fraction": max(0.1, min(0.9, float(fraction))), "team": team}, delay_min) + \
+            f" (cost {price})"
+
+    def jam(self, target_zone, delay_min=0):
+        self.red_only("jam")
+        jammer = self.ops.get("jammer") or {}
+        if jammer.get("unavailable"):
+            raise ValueError(jammer["unavailable"])
+        if any(f.get("operation") == "jam" for f in self.ops.get("flights", [])) or "jam" in self.ops_queued:
+            raise ValueError("a jammer is already flying or ordered")
+        z = self.zones.get(target_zone)
+        if not z or z["side"] in (self.side, "neutral"):
+            raise ValueError("target must be an enemy zone")
+        price = (self.ops.get("prices") or {}).get("jam", 0)
+        self.spend(price, "the jammer")
+        self.ops_queued.add("jam")
+        return self.add_order({"type": "jam", "targetZone": target_zone}, delay_min) + \
+            f" (cost {price}; SAM radars of {target_zone} within {jammer.get('rangeNm')} nm of the jammer hold fire " \
+            f"for up to {jammer.get('minutes')} min while it lives - escort it)"
+
     def finish_cycle(self, summary, notes=""):
         self.summary = str(summary)[:600]
         self.notes = str(notes)[:2000]
@@ -387,8 +575,10 @@ def tool_specs(side: str) -> list[dict]:
          obj({"capability": _s("string"), "target_zone": _s("string"), "delay_min": delay}, ["capability"])),
         ("launch_mission", "Free-form mission from any own origin to any target, paid from credits. "
                            "Roles: CAP (defensive patrol over target), SWEEP (fighter sweep), CAS, CAS_HELO, SEAD, "
-                           "RUNWAY_STRIKE, CONVOY, ARTY.",
-         obj({"origin": _s("string"), "role": _s("string"), "target_zone": _s("string"), "delay_min": delay},
+                           "RUNWAY_STRIKE, CONVOY, ARTY. Optional template picks the exact aircraft and loadout "
+                           "(list_freeform_options shows each role's templates); without it Foothold picks one.",
+         obj({"origin": _s("string"), "role": _s("string"), "target_zone": _s("string"), "delay_min": delay,
+              "template": _s("string")},
              ["origin", "role", "target_zone"])),
         ("set_supply_priority", "Steer the automatic supply dispatcher for a zone: high, normal, low, or none "
                                 "(starve it).",
@@ -427,6 +617,40 @@ def tool_specs(side: str) -> list[dict]:
                   "targets": {"type": "array", "items": _s("string")}}, ["item"])),
             ("trigger_event", "Start one of the mission's scripted RED events.", obj({"event": _s("string")},
                                                                                     ["event"])),
+            ("list_operations", "RED operations: prices, ground templates you can deploy, zones with a free "
+                                "upgrade slot and the templates they take, fire systems (range, salvo, reload), "
+                                "helicopter origins, raid guns, ambush teams, jammer, AWACS, and what is in "
+                                "progress.", obj({})),
+            ("deploy_forces", "Place an extra ground group (armor, AAA, SHORAD, SAM, infantry, artillery) in one of "
+                              "your zones. It fights but does not count as a zone defender for capture.",
+             obj({"zone": _s("string"), "template": _s("string")}, ["zone", "template"])),
+            ("upgrade_zone", "Fill a zone's free upgrade slot with an exact template. It becomes a permanent "
+                             "defender of the zone (rebuilt by supply like other defenders).",
+             obj({"zone": _s("string"), "template": _s("string")}, ["zone", "template"])),
+            ("fire_mission", "Long-range strike: a launcher battery sets up in your origin zone and fires at an "
+                             "enemy zone's units. The battery stays as a target for a while; each system then "
+                             "reloads.",
+             obj({"system": _s("string"), "origin": _s("string"), "target_zone": _s("string"),
+                  "delay_min": delay}, ["system", "origin", "target_zone"])),
+            ("move_awacs", "Move the RED AWACS orbit over one of your zones (race track heading_deg, leg_nm).",
+             obj({"zone": _s("string"), "heading_deg": _s("number"), "leg_nm": _s("number")}, ["zone"])),
+            ("supply_airlift", "Add supply units to one of your zones at once (the dispatcher then uses them).",
+             obj({"zone": _s("string")}, ["zone"])),
+            ("heli_raid", "A Mi-8 carries an artillery piece from a helicopter origin, lands it within range of an "
+                          "enemy zone, the gun fires; the helicopter flies home. Can be shot down on the way.",
+             obj({"origin": _s("string"), "target_zone": _s("string"), "gun": _s("string"),
+                  "delay_min": delay}, ["origin", "target_zone"])),
+            ("air_assault", "A Mi-8 lands troops in a neutral zone; they capture it if they survive.",
+             obj({"origin": _s("string"), "target_zone": _s("string"), "delay_min": delay},
+                 ["origin", "target_zone"])),
+            ("ambush", "A Mi-8 drops a MANPADS or AAA team on the line from from_zone to toward_zone, at "
+                       "fraction (0.1-0.9) of the way. Use it on routes enemy helicopters and CAS fly.",
+             obj({"origin": _s("string"), "from_zone": _s("string"), "toward_zone": _s("string"),
+                  "fraction": _s("number"), "team": _s("string"), "delay_min": delay},
+                 ["origin", "from_zone", "toward_zone"])),
+            ("jam", "Send the RED jammer to orbit near an enemy zone: its SAM radars within range hold fire while "
+                    "the jammer lives. Time SEAD/strikes to arrive while it is on station.",
+             obj({"target_zone": _s("string"), "delay_min": delay}, ["target_zone"])),
         ]
     else:
         specs += [
