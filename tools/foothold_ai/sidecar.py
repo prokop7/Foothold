@@ -6,9 +6,10 @@ The mission writes state_<side>_<kind>.json into <Saved Games>/DCS/Missions/Save
 this script answers with orders_<side>_<kind>.lua (a data-only "return { ... }" file),
 written atomically so the mission never reads a partial file.
 
-Standard library only. Claude is called as:
-    claude -p --model opus --output-format json --json-schema <schema> --tools "" ...
-with the prompt on stdin, so it uses your Claude subscription login.
+Standard library only. Each planning cycle runs Claude Code headless:
+    claude -p --model opus --mcp-config <foothold tools> --tools "" --permission-mode dontAsk ...
+with the prompt on stdin, so it uses your Claude subscription login. Claude
+reads the battlefield and issues orders through the game tools in mcp_server.py.
 
 Usage:
     python sidecar.py --check          # test the Claude CLI once, no DCS needed
@@ -32,12 +33,13 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-import commander  # noqa: E402
+import agent  # noqa: E402
 
 STATE_SCHEMA = "footholdai.state.v1"
 ORDERS_SCHEMA = "footholdai.orders.v1"
 SIDES = ("red", "blue")
-STATE_KINDS = ("ping", "commander")
+STATE_KINDS = ("ping", "command")
+ASYNC_KINDS = {"command"}  # long Claude cycles run in the worker pool
 
 log = logging.getLogger("footholdai")
 
@@ -178,6 +180,32 @@ class ClaudeCli:
                 "models": sorted((envelope.get("modelUsage") or {}).keys())}
 
 
+    def run_agent(self, prompt: str, system_prompt_file: pathlib.Path, mcp_config: pathlib.Path,
+                  allowed_tools: list[str], effort: str, timeout: float) -> dict:
+        """Run one agentic cycle with the Foothold MCP tools and no built-in tools."""
+        args = [
+            self.command, "-p",
+            "--model", self.model,
+            "--effort", effort,
+            "--output-format", "json",
+            "--tools", "",
+            "--no-session-persistence",
+            "--strict-mcp-config",
+            "--mcp-config", str(mcp_config),
+            "--allowedTools", ",".join(allowed_tools),
+            "--permission-mode", "dontAsk",
+            "--system-prompt-file", str(system_prompt_file),
+        ]
+        proc = subprocess.run(args, input=prompt, capture_output=True, text=True, encoding="utf-8",
+                              timeout=timeout, cwd=self.workdir)
+        if proc.returncode != 0:
+            raise RuntimeError(f"claude exited {proc.returncode}: {proc.stderr.strip()[:500]}")
+        try:
+            return json.loads(proc.stdout)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"claude returned non-JSON output: {proc.stdout[:300]!r}") from exc
+
+
 PING_SCHEMA = {
     "type": "object",
     "properties": {"ack": {"type": "string"}},
@@ -197,10 +225,12 @@ def claude_link_test(claude: ClaudeCli) -> dict:
 # ---------------------------------------------------------------------------
 
 class Bridge:
-    def __init__(self, exchange: pathlib.Path, claude: ClaudeCli | None, commander_effort: str = "high"):
+    def __init__(self, exchange: pathlib.Path, claude: ClaudeCli | None, cycle_effort: str = "medium",
+                 cycle_timeout: float = 600.0):
         self.exchange = exchange
         self.claude = claude
-        self.commander_effort = commander_effort
+        self.cycle_effort = cycle_effort
+        self.cycle_timeout = cycle_timeout
         self.last_stamp: dict[tuple, tuple] = {}
         self.last_seq: dict[tuple, tuple] = {}
         self.order_seq = 0
@@ -268,34 +298,31 @@ class Bridge:
                 log.error("%s: Claude link test failed: %s", side, exc)
         return {"kind": "pong", "claude": claude_info}
 
-    def on_commander(self, side: str, state: dict) -> dict | None:
+    def on_command(self, side: str, state: dict) -> dict | None:
         if not self.claude:
-            log.info("%s: commander request seq=%s skipped (dry run)", side, state.get("seq"))
+            log.info("%s: planning request seq=%s skipped (dry run)", side, state.get("seq"))
             return None
         reason = (state.get("payload") or {}).get("reason")
-        log.info("%s: commander request seq=%s reason=%s - asking Claude", side, state.get("seq"), reason)
-        orders = commander.handle(self.claude, self.exchange, side, state, self.commander_effort)
-        log.info("%s: commander plans=%s summary=%s", side,
-                 [p["name"] for p in orders["plans"]], orders["summary"])
-        return orders
+        log.info("%s: planning cycle for seq=%s reason=%s - Claude is in command", side, state.get("seq"), reason)
+        return agent.run_cycle(self.claude, self.exchange, side, state, self.cycle_effort, self.cycle_timeout)
 
     def _handle_async(self, side: str, state: dict) -> None:
         try:
             self.handle(side, state)
         except Exception:
-            log.exception("%s: commander request seq=%s failed", side, state.get("seq"))
+            log.exception("%s: planning cycle seq=%s failed", side, state.get("seq"))
         finally:
             self.busy.discard(side)
 
     def poll_once(self) -> None:
         for side in SIDES:
             for kind in STATE_KINDS:
-                if kind == "commander" and side in self.busy:
-                    continue  # newer request is read after the running call finishes
+                if kind in ASYNC_KINDS and side in self.busy:
+                    continue  # newer request is read after the running cycle finishes
                 state = self.read_state(side, kind)
                 if not state:
                     continue
-                if kind == "commander":
+                if kind in ASYNC_KINDS:
                     self.busy.add(side)
                     self.pool.submit(self._handle_async, side, state)
                     continue
@@ -323,8 +350,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--model", default="opus", help="Claude model alias (default: opus)")
     parser.add_argument("--effort", default="medium", choices=["low", "medium", "high", "xhigh", "max"],
                         help="effort for link tests (default: medium)")
-    parser.add_argument("--commander-effort", default="high", choices=["low", "medium", "high", "xhigh", "max"],
-                        help="effort for commander plans (default: high)")
+    parser.add_argument("--cycle-effort", default="medium", choices=["low", "medium", "high", "xhigh", "max"],
+                        help="Claude effort for planning cycles (default: medium)")
+    parser.add_argument("--cycle-timeout", type=float, default=600.0,
+                        help="seconds a planning cycle may take before it is stopped (default: 600)")
     parser.add_argument("--timeout", type=float, default=300.0, help="seconds per Claude call")
     parser.add_argument("--poll", type=float, default=2.0, help="seconds between state polls")
     parser.add_argument("--dry-run", action="store_true", help="never call Claude")
@@ -356,7 +385,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     try:
-        Bridge(exchange, claude, args.commander_effort).run(args.poll)
+        Bridge(exchange, claude, args.cycle_effort, args.cycle_timeout).run(args.poll)
     except KeyboardInterrupt:
         log.info("stopped")
     return 0

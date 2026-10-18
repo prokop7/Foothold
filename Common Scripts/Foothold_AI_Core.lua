@@ -50,27 +50,27 @@ FAI.defaults = {
 		-- Add task = 'CAS' (or another DCS main task) to change the group task.
 		typeOverride = {},
 	},
-	commander = {
+	-- Claude commands these sides. Foothold's Director stops deciding for them:
+	-- nothing launches, is bought or reacts unless Claude ordered it (directly
+	-- or through a standing order). Player shop purchases are unaffected.
+	command = {
 		enabled = true,
 		sides = { 'red', 'blue' },
-		firstRequestSec = 120,   -- after the Director reports ready
-		intervalSec = 900,       -- regular re-plan
-		eventMinIntervalSec = 240, -- earliest re-plan after a zone changes hands
-		retrySec = 600,          -- ask again if no answer arrived
-		planTtlSec = 1800,       -- a plan stops steering after this long without renewal
-		maxCandidates = 12,
-		maxAreas = 8,
-		maxContacts = 25,
-		maxEvents = 12,
-		announceBlue = true,     -- show BLUE HQ intent to BLUE players
-		bias = {
-			minWeight = 0.25,
-			maxWeight = 4,
-			avoidWeight = 0.2,
-			reinforceBonus = 150,
-			capBonus = 250,
-			blueFocusBonus = 150,
-		},
+		firstRequestSec = 60,     -- after the Director reports ready
+		cycleSec = 300,           -- regular planning cycle
+		eventMinGapSec = 90,      -- earliest extra cycle after an event
+		requestTimeoutSec = 900,  -- ask again if a cycle never answered
+		evalPerTick = 15,         -- capability eligibility checks per 0.2 s while building a snapshot
+		maxContacts = 30,
+		maxEvents = 30,
+		maxResults = 40,
+		authorizationTimeoutSec = 1200, -- an authorized group that never launched is released
+		standingTickSec = 10,
+		maxStandingOrders = 12,
+		priceScale = 1,           -- free-form mission prices = Foothold shop price x priceScale
+		fallbackPrices = { CAP = 500, SWEEP = 500, CAS = 1000, CAS_HELO = 1000, SEAD = 500,
+			RUNWAY_STRIKE = 500, CONVOY = 1000, ARTY = 1000 },
+		supplyBonus = { high = 400, normal = 0, low = -300 },
 	},
 }
 
@@ -221,6 +221,43 @@ function FAI.json.encode(value)
 	local out = {}
 	encode(value, out, 0)
 	return table.concat(out)
+end
+
+-- Data-only Lua literal ("return { ... }") readable with FAI.loadDataFile.
+local function serialize(value, out, depth)
+	local kind = type(value)
+	if kind == 'string' then
+		out[#out + 1] = string.format('%q', value)
+	elseif kind == 'number' or kind == 'boolean' then
+		out[#out + 1] = tostring(value)
+	elseif kind == 'table' and depth < 16 then
+		out[#out + 1] = '{'
+		for k, v in pairs(value) do
+			if type(k) == 'string' or type(k) == 'number' then
+				local vk = type(v)
+				if vk == 'string' or vk == 'number' or vk == 'boolean' or vk == 'table' then
+					out[#out + 1] = '['
+					serialize(k, out, depth + 1)
+					out[#out + 1] = ']='
+					serialize(v, out, depth + 1)
+					out[#out + 1] = ','
+				end
+			end
+		end
+		out[#out + 1] = '}'
+	else
+		out[#out + 1] = 'nil'
+	end
+end
+
+function FAI.writeDataFile(path, value)
+	local out = { 'return ' }
+	serialize(value, out, 0)
+	local f, err = io.open(path, 'w')
+	if not f then return false, err end
+	f:write(table.concat(out))
+	f:close()
+	return true
 end
 
 ---------------------------------------------------------------------------

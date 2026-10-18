@@ -30,7 +30,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import miz_lua  # noqa: E402
 
 REPO = pathlib.Path(__file__).resolve().parents[2]
-DEFAULT_SCRIPTS = ["Foothold_AI_Core.lua", "Foothold_AI_Wingman.lua", "Foothold_AI_Commander.lua"]
+DEFAULT_SCRIPTS = ["Foothold_AI_Core.lua", "Foothold_AI_Wingman.lua", "Foothold_AI_Command.lua"]
 TRIGGER_COMMENT = "Foothold AI"
 MISSION = "mission"
 MAP_RESOURCE = "l10n/DEFAULT/mapResource"

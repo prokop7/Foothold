@@ -1,7 +1,8 @@
 # Foothold AI – setup and testing
 
 Batch 1 contains the foundation (the mission ↔ Claude bridge) and the AI wingman.
-Batch 2 adds the Claude commander for RED and BLUE (phase 2).
+Batch 2 puts Claude **in command** of RED and BLUE: Foothold's own AI commander is off for those sides,
+and Claude plans every few minutes through game tools while its standing orders handle instant reactions.
 The overall plan is in [PLAN.md](PLAN.md).
 
 ## Files
@@ -10,9 +11,10 @@ The overall plan is in [PLAN.md](PLAN.md).
 |---|---|
 | `Common Scripts/Foothold_AI_Core.lua` | Config, logging, the mailbox shared with the sidecar, and the link test |
 | `Common Scripts/Foothold_AI_Wingman.lua` | F10 "AI Wingman" menu |
-| `Common Scripts/Foothold_AI_Commander.lua` | Fog-of-war snapshot, plan validation, Director hooks |
-| `tools/foothold_ai/commander.py` | Commander schema, prompt and per-campaign memory (used by the sidecar) |
-| `tools/foothold_ai/prompts/commander_*.md` | System prompts for the RED commander and BLUE HQ (edit freely) |
+| `Common Scripts/Foothold_AI_Command.lua` | Takeover of Foothold's AI decisions, order executor, standing orders, snapshots |
+| `tools/foothold_ai/agent.py` | Runs one Claude planning cycle per side (memory, personality, logs) |
+| `tools/foothold_ai/mcp_server.py` | The game tools Claude uses (query the situation, issue orders) |
+| `tools/foothold_ai/prompts/command_*.md` | System prompts for the RED commander and BLUE HQ (edit freely) |
 | `tools/foothold_ai/patch_miz.py` | Embeds the scripts in a `.miz` and adds the "Foothold AI" trigger |
 | `tools/foothold_ai/sidecar.py` | Bridge between DCS and your local Claude Code (stdlib Python) |
 | `tools/foothold_ai/tests/` | Offline tests (`pip install lupa`, then `python -m unittest discover -s tools/foothold_ai/tests`) |
@@ -22,9 +24,9 @@ The overall plan is in [PLAN.md](PLAN.md).
 1. **Claude Code CLI.** In a terminal run:
    ```
    claude --version
-   claude --help | findstr json-schema
+   claude --help | findstr "mcp-config permission-mode json-schema"
    ```
-   The second command must print a `--json-schema` line; if it doesn't, update Claude Code. The native installer (`claude.exe`) is recommended over the npm `claude.cmd` wrapper.
+   All three flags must be listed; if not, update Claude Code (checked on 2.1.302). The native installer (`claude.exe`) is recommended over the npm `claude.cmd` wrapper.
 2. **Check the sidecar can reach Claude** (no DCS needed):
    ```
    python tools\foothold_ai\sidecar.py --check
@@ -45,7 +47,8 @@ The overall plan is in [PLAN.md](PLAN.md).
    ```
    It finds `%USERPROFILE%\Saved Games\DCS` (or `DCS.openbeta`); use `--saved-games <path>` otherwise.
    Exchange files and `sidecar.log` live in `Saved Games\DCS\Missions\Saves\FootholdAI\`.
-   Commander plans use `--commander-effort high` by default (`medium` is faster; `xhigh`/`max` think longer).
+   Planning cycles use `--cycle-effort medium` (`high` thinks longer) and stop after `--cycle-timeout 600` seconds;
+   orders queued before a timeout are still sent.
 2. Host the `_AI.miz` from the game as usual.
 
 Optional config: create `Saved Games\DCS\Missions\Saves\FootholdAI\FootholdAI_Config.lua`:
@@ -86,26 +89,31 @@ Send back `Saved Games\DCS\Logs\dcs.log`, `...\FootholdAI\sidecar.log`, and a sh
 
 Note which aircraft types failed to spawn or behaved oddly, e.g. never engaged ground targets. Those go into `typeOverride`.
 
-## Test batch 2 checklist (commander)
+## Test batch 2 checklist (Claude in command)
 
-The commander needs the sidecar running and Claude reachable (batch 1 bridge items).
+Re-patch the mission first (the commander file changed). The sidecar must be running.
 
-- [ ] About 2 minutes after the Director is ready, `dcs.log` shows `[FootholdAI][commander] red requested plan ... reason=start`, and the same for blue.
-- [ ] `sidecar.log` shows `commander plans=[...]` for each side, usually within 1–2 minutes.
-- [ ] `dcs.log` shows `red picked plan "..." from [...]` and `red strategy=... goal=...`.
-- [ ] BLUE players see a `HQ intent: ...` message.
-- [ ] Over a longer session: re-plans every 15 minutes (`reason=interval`), and sooner after a zone changes hands (`reason=zone-change`).
-- [ ] Does RED behaviour follow the plan? Compare the Director's `operation=... target=...` log lines with the plan's focus zones.
-- [ ] No `hook ... failed` warnings. If one appears, Foothold kept its default behaviour; send the log line.
+**Takeover**
+- [ ] `dcs.log`: `[FootholdAI][command] Claude commands: blue,red (Foothold Director decisions off for these sides)`, and no `hook skipped` warnings.
+- [ ] Before Claude's first cycle, no RED or BLUE AI flights or attacks launch (supply flights and anything you buy in the shop still do).
 
-Files to send for batch 2, in addition to `dcs.log` and `sidecar.log`:
-- `commander_red.log` and `commander_blue.log` (every plan Claude produced).
-- `memory_*.json` (personality and plan history per campaign).
-- `state_red_commander.json` / `state_blue_commander.json` (the last snapshot sent).
+**Cycles**
+- [ ] About 1 minute after the Director is ready: `red snapshot seq=... reason=start` (and blue).
+- [ ] `sidecar.log`: `red: cycle 1 done in N s, M orders` (it took about 30–60 s in testing).
+- [ ] `dcs.log`: `red order r1-c1 executed ...` lines; rejected orders show the reason.
+- [ ] Every 5 minutes a new cycle (`reason=cycle`); after a zone changes hands or a standing order fires, an extra one (`reason=event`).
+- [ ] BLUE: `HQ: ...` messages, and player missions (CAS, SEAD, ...) only for zones HQ designated.
 
-Commander settings (in `FootholdAI_Config.lua`, under `commander = { ... }`):
-`intervalSec` (default 900), `eventMinIntervalSec` (240), `planTtlSec` (1800), `announceBlue` (true), `sides` (`{ 'red', 'blue' }`), and `bias` strengths.
-To change a campaign's personality, edit or delete its `memory_*.json` file.
+**In the air**
+- [ ] Claude's launches appear as AI flights from the ordered origin to the ordered target.
+- [ ] Timed packages: SEAD and strike ordered with `delay_min` arrive close together.
+- [ ] Standing orders: fly toward a RED zone with a scramble rule and RED CAP launches without waiting for a cycle (`standing order ... executed`).
+- [ ] Anything launching that Claude did **not** order (no matching `order ... executed` line) is a gap in the takeover. Please note what and where.
+
+**Send back:** `dcs.log`, `sidecar.log`, `command_red.log` / `command_blue.log` (every cycle's summary and orders), `memory_*_red.json` / `memory_*_blue.json`, and the `cycles\` folder (last snapshot and orders per side).
+
+**Settings** (`FootholdAI_Config.lua`, under `command = { ... }`): `sides` (`{ 'red', 'blue' }`, or one side only), `cycleSec` (300), `eventMinGapSec` (90), `priceScale` (1), `maxStandingOrders` (12).
+To change a campaign's personality, edit or delete its `memory_*_<side>.json` file.
 
 ## Known limitations (batch 1)
 - Menu text is English only. Foothold's localization will be added once the feature set settles.
@@ -113,6 +121,8 @@ To change a campaign's personality, edit or delete its `memory_*.json` file.
 - Dismiss removes the aircraft instantly.
 
 ## Known limitations (batch 2)
-- The commander steers priorities only. Foothold's Director still decides whether an operation is possible and which aircraft fly it.
-- RED knows BLUE aircraft only from Foothold's EWRS radar registry. BLUE FARPs and ground units are not reported yet (phase 3).
-- The plan stops steering 30 min after it was received if no new plan arrives, e.g. when the sidecar is stopped.
+- Claude sets timing with launch delays. Foothold flights have no shared push point yet (phase 4), so arrival times can drift with start-up and taxi.
+- Group size and loadout come from the mission's templates; Claude chooses what, where and when, not the airframes.
+- RED sees BLUE aircraft only through its radars (Foothold's EWRS registry); BLUE FARPs and ground units are not reported yet.
+- If the sidecar stops, nothing on the Claude sides acts (no fallback, by design) until it is running again.
+- Player strike missions from Foothold's event scheduler (e.g. the warehouse and port strikes) are still chosen by Foothold.

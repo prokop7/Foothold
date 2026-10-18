@@ -1,8 +1,6 @@
 # Foothold AI – plan
 
-An AI layer for Foothold: Claude (Opus, through the local Claude Code subscription) commands
-RED and BLUE AI at the strategic and package level, and Lua inside the mission runs everything in real time.
-Players also get AI wingmen.
+Claude (Opus, through the local Claude Code subscription) **commands** RED and BLUE. Foothold's own AI commander is switched off for those sides, and Foothold's scripts only carry out Claude's orders: spawning, routing, warehouses, supply, saving. Instant reactions between planning cycles come from standing orders that Claude writes and Lua runs. Players also get AI wingmen.
 
 ## Decisions (from the project owner)
 
@@ -12,105 +10,93 @@ Players also get AI wingmen.
 | Claude access | Local Claude Code CLI with a Max 20x subscription (`claude -p`, model `opus`); no API key |
 | First test mission | Persian Gulf (`Foothold_PG_5.3.5_...miz`, setup `foothold pg nya v2.lua`) |
 | Integration | New `Foothold_AI_*.lua` files, loaded by a trigger that `tools/foothold_ai/patch_miz.py` adds. **No edits to `zoneCommanderv2.lua`** |
+| Who decides | **Claude decides everything** for its sides; Foothold's Director decisions are off; **no fallback** |
+| Assets | Foothold's pre-built capabilities **and** free-form missions (any own origin, role and target), priced from the Foothold shop |
+| Reactions | Both: instant standing orders run by Lua, and thoughtful package planning by Claude each cycle |
+| Supply | Claude sets priorities; the existing dispatcher flies routine runs; Claude can order extra runs |
+| BLUE player tasking | Claude HQ picks the zones offered to players per role |
+| Cadence | A planning cycle every 5 minutes per side, plus extra cycles after events |
+| How Claude works | Autonomous agent with game tools (MCP); it cannot ask the user questions |
 | Wingman | Air-start next to the player, same aircraft type as the player, free while testing |
-| LLM sides | RED and BLUE AI |
-| Fog of war | Zone ownership and strength are public; enemy aircraft, FARPs and units are visible only when detected |
-| Sidecar | Python 3 (stdlib only) |
-| Players | Mostly solo |
-| Testing | Batched: the owner runs DCS and sends back `dcs.log` |
+| Fog of war | Zone ownership and strength are public; enemy aircraft only when this side's radars detect them |
+| Sidecar | Python 3, standard library only |
+| Testing | Batched: the owner runs DCS and sends back logs |
 
 ## Architecture
 
 ```
-DCS mission (Lua)                                         Windows PC
-┌───────────────────────────────────────────┐            ┌──────────────────────────────┐
-│ Foothold (unchanged): Director, BC, CTLD  │            │ tools/foothold_ai/sidecar.py │
-│   ▲ wrapped methods (later phases)        │            │  - polls state files         │
-│ Foothold_AI_Core.lua                      │  state_*.json  - builds prompt          │
-│   - config, log, JSON writer, mailbox ────┼──────────► │  - claude -p --model opus    │
-│   - order reader (sandboxed loadfile) ◄───┼─ orders_*.lua    --json-schema …         │
-│ Foothold_AI_Wingman.lua (no LLM)          │            │  - writes Lua orders (atomic)│
-│ Foothold_AI_Commander.lua (phase 2+)      │            └──────────────────────────────┘
-│ Foothold_AI_Actions.lua  (phase 3+)       │
-│ Foothold_AI_ATO.lua      (phase 4+)       │
-└───────────────────────────────────────────┘
-Exchange folder: <Saved Games>\DCS\Missions\Saves\FootholdAI\
+DCS mission (Lua)                                    Windows PC
+┌──────────────────────────────────────────┐        ┌──────────────────────────────────────────┐
+│ Foothold: BattleCommander, Director, CTLD│        │ sidecar.py  (polls state files)          │
+│   Director decisions OFF for Claude sides│        │   └ agent.py  one cycle per side:        │
+│   (wrapped, see "Takeover")              │        │       claude -p --model opus             │
+│ Foothold_AI_Core.lua   mailbox, config   │ state  │         --mcp-config → mcp_server.py     │
+│ Foothold_AI_Command.lua                  │───────►│         --tools "" --permission-mode     │
+│   snapshot · executor · standing orders  │        │           dontAsk                        │
+│   spawn gate · mission tracking          │◄───────│       Claude: get_overview, list_*,      │
+│ Foothold_AI_Wingman.lua  (no LLM)        │ orders │       launch_*, purchase, set_*,         │
+└──────────────────────────────────────────┘        │       finish_cycle                       │
+Exchange folder: <Saved Games>\DCS\Missions\Saves\FootholdAI\                                     │
+                                                    └──────────────────────────────────────────┘
 ```
 
-Rules that apply to every phase:
+**One cycle:**
+1. Lua builds a snapshot: zones, every own capability with an eligibility check and reason, free-form roles and prices, purchases, missions, radar contacts, events, and the results of earlier orders.
+2. The sidecar starts Claude Code headless with the Foothold game tools.
+3. Claude inspects the situation, issues orders (each checked immediately by the tool, with a specific error), and calls `finish_cycle` with a summary and notes for its next cycle.
+4. The sidecar writes the orders file. Lua executes each order now or after `delaySec`, then reports the results in the next snapshot.
 
-1. **Claude only picks from options Lua generated.** Lua validates every order against live state and ignores anything invalid.
-2. **If Claude is unavailable, Foothold plays exactly as today.** Every hook falls back to the original method.
-3. **Nothing in the sim waits on Claude.** Reactions (scrambles, CAP revectors, SEAD reactions) stay in Lua.
-4. **Mission Lua uses only `io` and `lfs`.** Foothold already needs both; `os` is not used.
+## Takeover (what is switched off for a Claude-commanded side)
+
+| Foothold behaviour | Under Claude |
+|---|---|
+| Director operations, routine CAP, ground releases, reactions, BLUE assignments | Neutral (wrapped methods return "nothing to do") |
+| `Director:allowsGroupSpawn` | Gate: only groups Claude authorized, live groups, supply, player/shop launches and save restores spawn |
+| Director budget purchases | Only Claude's `purchase` orders |
+| RED reactive system (`_redReactiveTick`) | Off |
+| `EventCommander` random RED events | Off; Claude can `trigger_event` |
+| Supply dispatcher | Runs, steered by Claude's `supply_priority`; Claude can order `supply_run` |
+| BLUE player mission targets (`selectMissionTarget`) | Claude's `player_tasks`; undesignated roles get no missions |
+| Player shop, CTLD, AIEN, wingman | Unchanged |
+
+## Orders (Lua executes, using Foothold's own code paths)
+
+| Order | Foothold path |
+|---|---|
+| `launch_capability` (optional new target for CAP/CAS/SEAD/RUNWAYSTRIKE) | eligibility → `resolveDirectorCandidate` → `_retaskGroupForAssignment` → `_authorizeDirectorOnDemandGroup` |
+| `launch_mission` (free-form) | runtime `DirectorCapability` like Foothold's DynamicHybrid (`FAI-<side>-<origin>-<target>-<role>`), then the same launch; costs credits; saved to `freeform_*.lua` and re-registered at start |
+| `purchase` (RED: upgrade zone/category, warehouse, repair, mass_attack, bomber) | `Director:_executeStrategicBudgetCandidate` with the zone/category honoured via `selectZoneUpgradeTarget` |
+| `supply_priority`, `supply_run` | `_regularSupplyTargetPriority` bonus or starve; `_dispatchRegularSupplyCommander` |
+| `player_tasks` (BLUE) | `selectMissionTarget` |
+| `trigger_event` (RED) | `evc` scripted events |
+| `hq_message` (BLUE) | coalition text |
+| `standing_orders` | Lua rules: `enemy_air_near` (EWRS radar contacts), `zone_attacked` (AIEN reports, RED), `zone_lost`; with cooldown, max active, and `$zone` substitution |
+
+Denied launches (e.g. runway blocked, origin lost) are cleaned up like the Director's own denials and reported to Claude.
 
 ## Phases
 
-### Phase 0 – foundation (batch 1, done)
-- `Foothold_AI_Core.lua`: config defaults plus an optional external config, logging, a JSON encoder, the mailbox (state out, orders in), and a link test (ping/pong).
-- `tools/foothold_ai/sidecar.py`: polls the state files, calls `claude -p`, and writes orders atomically.
-- `tools/foothold_ai/patch_miz.py`: embeds the scripts in a `.miz`, adds a "Foothold AI" trigger after AIEN, and verifies the result.
-
-**Test:** the mission loads without Lua errors. The sidecar log shows a ping, a Claude call and a pong. `dcs.log` shows `link ok` with the round-trip time.
-
-### Phase 1 – AI wingman (batch 1, done, no LLM)
-- Adds an F10 "AI Wingman" menu for players in an airplane or helicopter slot.
-- **Request:** 1 or 3 wingmen. Each is a copy of the player's own slot template (same type, default loadout, livery), air-started behind the player. Only available when the player is airborne.
-- **Commands:** join up, cover me (engage air), attack ground near me, attack air defences near me, attack ships near me, attack my map mark (`wm` marker), weapons free/hold, hold here, status, RTB, dismiss.
-- **Lifecycle:** the wingman RTBs when the player dies or leaves the slot, is removed after landing, and is cleaned up when dead.
-
-**Test:** spawn in each player type you care about. Record which types AI can actually fly, then fill `FootholdAI.config.wingman.typeOverride`.
-
-### Phase 2 – snapshot + Claude commander (batch 2, done)
-- `Foothold_AI_Commander.lua` sends a fog-of-war snapshot per side (`state_<side>_commander.json`). It contains:
-  - zones with ownership, strength (`built` vs upgrade cap), income, connections and frontline flags;
-  - credits;
-  - the Director's cached target candidates and area ranking;
-  - the current operation and strategy;
-  - enemy aircraft detected by this side's radars (Foothold's EWRS registry);
-  - recent zone changes and operation results.
-- The sidecar (`commander.py`) builds a JSON schema where every zone field is an enum of the zones in the snapshot. It calls `claude -p --model opus` with `prompts/commander_<side>.md`, and keeps a per-campaign memory (personality and plan history).
-- Claude returns 2–3 weighted plans; Lua validates them and picks one at random.
-- Hooks (class-level wrappers; each falls back to Foothold's result on error, and does nothing when no plan is active):
-
-| Hook | Effect | Side |
+| Phase | Content | Status |
 |---|---|---|
-| `campaignStrategy` (set directly) | strategy and goal zone | RED |
-| `_collectTargetCandidates` | focus ×weight, avoid ×0.2 | RED |
-| `_areaFirstCandidateOrder` | re-ranks areas that contain focus zones, for that call only | RED |
-| `_doctrineSelectionWeight` | ×doctrine weight | RED |
-| `_strategicBudgetCandidates` | ×budget weight, re-sorted | RED |
-| `_zoneUpgradeScore` | bonus for reinforce zones | RED |
-| `rankCapZones` | bonus for CAP zones (on a copy of the Director's cache) | both |
-| `_blueMissionCandidateScore` | focus bonus, avoid ×0.2 | BLUE |
-| `_finishOperation`, `recordZoneOwnershipChange` | outcome history, early re-plan | both |
-
-### Phase 3 – RED player-like actions
-- `REINFORCE`: extra armor, AAA or SHORAD for a zone, placed on clear ground, delivered and saved across restarts.
-- `BUILD_FARP`: a side-aware version of `BuildAFARP` (today it is hard-coded to the BLUE side and USA country), with site selection, saving, and use as a launch point.
-- `ARTY_RAID`: a helo carries artillery (simulated) to a landing zone in range, it fires with `AUFTRAG:NewARTY`, then it is extracted.
-- `AMBUSH`: a MANPADS team placed on a likely player route.
-- A play runner: multi-step plays with pre-checks, timeouts and Claude replans.
-
-### Phase 4 – ATO executor (both sides)
-- Packages with a time on target (TOT). Launch times are computed backwards from the TOT, flights hold at the IP until the push time, and use `ETA` on attack waypoints.
-- Elements: SEAD, DEAD, strike, anti-ship and escort; several packages can run at once.
-- The executor claims aircraft by wrapping `Director:allowsGroupSpawn` / `_canManageGroup`.
-
-### Phase 5 – player integration
-- A "Join package" F10 option lets the player take an element slot, and the AI holds at the IP until the shared push time.
-- Optional: natural-language wingman commands through a GameGUI hook for chat, and SRS voice later.
+| 0 | Foundation: core, bridge, patcher, link test | done (batch 1) |
+| 1 | AI wingman | done (batch 1) |
+| 2 | ~~Bias commander~~ replaced by **Claude command mode** (above) | done (batch 2) |
+| 3 | RED player-like actions: extra armor/AAA anywhere, RED FARPs, heli-borne artillery raids, ambushes, as new order types | next |
+| 4 | Package timing in Lua: IP hold and push time, so packages hit together regardless of start-up delays (today Claude times with `delaySec`) | planned |
+| 5 | Player joins AI packages; natural-language wingman | planned |
 
 ## Things that must be checked in DCS, not assumed
 
 | Item | Why |
 |---|---|
-| Which player types AI can fly (e.g. `C-130J-30`, `F-14A-135-GR-Early`, `Mirage-F1*`) | Some module types may not fly as AI; the wingman logs a spawn failure and a type override covers it |
-| Wingman group `task` | Wingmen keep the slot's main task (CAP, CAS, …). If one never engages ground targets, change the task in `typeOverride` |
-| `claude --help` lists `--json-schema` on the Windows install | Checked on Claude Code 2.1.302; older versions may lack it |
-| Saved Games path | The sidecar takes `--saved-games`, defaulting to `%USERPROFILE%\Saved Games\DCS` |
+| Which player types AI can fly | Wingman spawn failures are logged; `typeOverride` covers them |
+| Wingman group `task` | Some types may need a different main task to engage ground targets |
+| `claude --help` lists `--mcp-config`, `--permission-mode` and `--system-prompt-file` | Checked on Claude Code 2.1.302 |
+| Saved Games path | `--saved-games` if not `%USERPROFILE%\Saved Games\DCS` |
+| Takeover completeness | Look for AI launches Claude did not order (any would mean a Foothold path I have not covered) |
+| Persistence | Claude-launched groups in flight when the mission saves and restarts |
 
 ## Risks
-- DCS AI timing and behaviour (TOT accuracy, taxi, engaging).
-- Conflicts with Foothold upstream updates. Mitigation: separate files and wrapped methods, no edits to `zoneCommanderv2.lua`.
-- Unit count and performance. Mitigation: unit budgets in config.
+- Usage limits: two Opus agent cycles every 5 minutes. Each test cycle took about 33 s and 14–16 tool calls. Raise `cycleSec` if limits bite.
+- DCS AI timing and behaviour.
+- Upstream Foothold changes to the wrapped methods. Mitigation: hooks are listed in one place and log a warning if a method is missing.

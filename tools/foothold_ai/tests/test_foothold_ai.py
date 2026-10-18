@@ -120,7 +120,7 @@ class FakeClaude:
 class SyntaxTest(unittest.TestCase):
     def test_scripts_compile_as_lua51(self):
         lua = lua51.LuaRuntime(unpack_returned_tuples=True)
-        for name in ("Foothold_AI_Core.lua", "Foothold_AI_Wingman.lua", "Foothold_AI_Commander.lua"):
+        for name in ("Foothold_AI_Core.lua", "Foothold_AI_Wingman.lua", "Foothold_AI_Command.lua"):
             code = (SCRIPTS / name).read_text(encoding="utf-8")
             ok, err = lua.eval("function(src, name) local f, e = loadstring(src, name) return f ~= nil, e end")(code, name)
             self.assertTrue(ok, f"{name}: {err}")
