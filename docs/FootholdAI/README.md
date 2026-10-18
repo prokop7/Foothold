@@ -1,6 +1,7 @@
-# Foothold AI – setup and test batch 1
+# Foothold AI – setup and testing
 
 Batch 1 contains the foundation (the mission ↔ Claude bridge) and the AI wingman.
+Batch 2 adds the Claude commander for RED and BLUE (phase 2).
 The overall plan is in [PLAN.md](PLAN.md).
 
 ## Files
@@ -9,6 +10,9 @@ The overall plan is in [PLAN.md](PLAN.md).
 |---|---|
 | `Common Scripts/Foothold_AI_Core.lua` | Config, logging, the mailbox shared with the sidecar, and the link test |
 | `Common Scripts/Foothold_AI_Wingman.lua` | F10 "AI Wingman" menu |
+| `Common Scripts/Foothold_AI_Commander.lua` | Fog-of-war snapshot, plan validation, Director hooks |
+| `tools/foothold_ai/commander.py` | Commander schema, prompt and per-campaign memory (used by the sidecar) |
+| `tools/foothold_ai/prompts/commander_*.md` | System prompts for the RED commander and BLUE HQ (edit freely) |
 | `tools/foothold_ai/patch_miz.py` | Embeds the scripts in a `.miz` and adds the "Foothold AI" trigger |
 | `tools/foothold_ai/sidecar.py` | Bridge between DCS and your local Claude Code (stdlib Python) |
 | `tools/foothold_ai/tests/` | Offline tests (`pip install lupa`, then `python -m unittest discover -s tools/foothold_ai/tests`) |
@@ -41,6 +45,7 @@ The overall plan is in [PLAN.md](PLAN.md).
    ```
    It finds `%USERPROFILE%\Saved Games\DCS` (or `DCS.openbeta`); use `--saved-games <path>` otherwise.
    Exchange files and `sidecar.log` live in `Saved Games\DCS\Missions\Saves\FootholdAI\`.
+   Commander plans use `--commander-effort high` by default (`medium` is faster; `xhigh`/`max` think longer).
 2. Host the `_AI.miz` from the game as usual.
 
 Optional config: create `Saved Games\DCS\Missions\Saves\FootholdAI\FootholdAI_Config.lua`:
@@ -81,7 +86,33 @@ Send back `Saved Games\DCS\Logs\dcs.log`, `...\FootholdAI\sidecar.log`, and a sh
 
 Note which aircraft types failed to spawn or behaved oddly, e.g. never engaged ground targets. Those go into `typeOverride`.
 
+## Test batch 2 checklist (commander)
+
+The commander needs the sidecar running and Claude reachable (batch 1 bridge items).
+
+- [ ] About 2 minutes after the Director is ready, `dcs.log` shows `[FootholdAI][commander] red requested plan ... reason=start`, and the same for blue.
+- [ ] `sidecar.log` shows `commander plans=[...]` for each side, usually within 1–2 minutes.
+- [ ] `dcs.log` shows `red picked plan "..." from [...]` and `red strategy=... goal=...`.
+- [ ] BLUE players see a `HQ intent: ...` message.
+- [ ] Over a longer session: re-plans every 15 minutes (`reason=interval`), and sooner after a zone changes hands (`reason=zone-change`).
+- [ ] Does RED behaviour follow the plan? Compare the Director's `operation=... target=...` log lines with the plan's focus zones.
+- [ ] No `hook ... failed` warnings. If one appears, Foothold kept its default behaviour; send the log line.
+
+Files to send for batch 2, in addition to `dcs.log` and `sidecar.log`:
+- `commander_red.log` and `commander_blue.log` (every plan Claude produced).
+- `memory_*.json` (personality and plan history per campaign).
+- `state_red_commander.json` / `state_blue_commander.json` (the last snapshot sent).
+
+Commander settings (in `FootholdAI_Config.lua`, under `commander = { ... }`):
+`intervalSec` (default 900), `eventMinIntervalSec` (240), `planTtlSec` (1800), `announceBlue` (true), `sides` (`{ 'red', 'blue' }`), and `bias` strengths.
+To change a campaign's personality, edit or delete its `memory_*.json` file.
+
 ## Known limitations (batch 1)
 - Menu text is English only. Foothold's localization will be added once the feature set settles.
 - Wingmen carry the slot's default loadout from the Mission Editor, not what you rearmed to.
 - Dismiss removes the aircraft instantly.
+
+## Known limitations (batch 2)
+- The commander steers priorities only. Foothold's Director still decides whether an operation is possible and which aircraft fly it.
+- RED knows BLUE aircraft only from Foothold's EWRS radar registry. BLUE FARPs and ground units are not reported yet (phase 3).
+- The plan stops steering 30 min after it was received if no new plan arrives, e.g. when the sidecar is stopped.

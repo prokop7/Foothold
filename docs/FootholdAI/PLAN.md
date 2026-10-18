@@ -46,14 +46,14 @@ Rules that apply to every phase:
 
 ## Phases
 
-### Phase 0 – foundation (this batch)
+### Phase 0 – foundation (batch 1, done)
 - `Foothold_AI_Core.lua`: config defaults plus an optional external config, logging, a JSON encoder, the mailbox (state out, orders in), and a link test (ping/pong).
 - `tools/foothold_ai/sidecar.py`: polls the state files, calls `claude -p`, and writes orders atomically.
 - `tools/foothold_ai/patch_miz.py`: embeds the scripts in a `.miz`, adds a "Foothold AI" trigger after AIEN, and verifies the result.
 
 **Test:** the mission loads without Lua errors. The sidecar log shows a ping, a Claude call and a pong. `dcs.log` shows `link ok` with the round-trip time.
 
-### Phase 1 – AI wingman (this batch, no LLM)
+### Phase 1 – AI wingman (batch 1, done, no LLM)
 - Adds an F10 "AI Wingman" menu for players in an airplane or helicopter slot.
 - **Request:** 1 or 3 wingmen. Each is a copy of the player's own slot template (same type, default loadout, livery), air-started behind the player. Only available when the player is airborne.
 - **Commands:** join up, cover me (engage air), attack ground near me, attack air defences near me, attack ships near me, attack my map mark (`wm` marker), weapons free/hold, hold here, status, RTB, dismiss.
@@ -61,10 +61,29 @@ Rules that apply to every phase:
 
 **Test:** spawn in each player type you care about. Record which types AI can actually fly, then fill `FootholdAI.config.wingman.typeOverride`.
 
-### Phase 2 – snapshot + Claude commander (RED, then BLUE)
-- A fog-of-war state snapshot per side: zones, ownership, strength, connections, credits/income, current Director operation, detected enemy air/FARPs, and recent outcomes.
-- The commander's decisions are campaign strategy, target area, doctrine, budget priority and CAP/QRA posture. They're applied by wrapping `Director:_selectCampaignStrategy`, `_areaFirstCandidateOrder`, `_pickDoctrine`, `_strategicBudgetDecision` and `rankCapZones`, always falling back to the original.
-- Variety: Claude returns 2–3 weighted options and Lua rolls between them. A commander personality is picked per campaign. Play memory is saved alongside Foothold's own save files.
+### Phase 2 – snapshot + Claude commander (batch 2, done)
+- `Foothold_AI_Commander.lua` sends a fog-of-war snapshot per side (`state_<side>_commander.json`). It contains:
+  - zones with ownership, strength (`built` vs upgrade cap), income, connections and frontline flags;
+  - credits;
+  - the Director's cached target candidates and area ranking;
+  - the current operation and strategy;
+  - enemy aircraft detected by this side's radars (Foothold's EWRS registry);
+  - recent zone changes and operation results.
+- The sidecar (`commander.py`) builds a JSON schema where every zone field is an enum of the zones in the snapshot. It calls `claude -p --model opus` with `prompts/commander_<side>.md`, and keeps a per-campaign memory (personality and plan history).
+- Claude returns 2–3 weighted plans; Lua validates them and picks one at random.
+- Hooks (class-level wrappers; each falls back to Foothold's result on error, and does nothing when no plan is active):
+
+| Hook | Effect | Side |
+|---|---|---|
+| `campaignStrategy` (set directly) | strategy and goal zone | RED |
+| `_collectTargetCandidates` | focus ×weight, avoid ×0.2 | RED |
+| `_areaFirstCandidateOrder` | re-ranks areas that contain focus zones, for that call only | RED |
+| `_doctrineSelectionWeight` | ×doctrine weight | RED |
+| `_strategicBudgetCandidates` | ×budget weight, re-sorted | RED |
+| `_zoneUpgradeScore` | bonus for reinforce zones | RED |
+| `rankCapZones` | bonus for CAP zones (on a copy of the Director's cache) | both |
+| `_blueMissionCandidateScore` | focus bonus, avoid ×0.2 | BLUE |
+| `_finishOperation`, `recordZoneOwnershipChange` | outcome history, early re-plan | both |
 
 ### Phase 3 – RED player-like actions
 - `REINFORCE`: extra armor, AAA or SHORAD for a zone, placed on clear ground, delivered and saved across restarts.

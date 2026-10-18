@@ -120,7 +120,7 @@ class FakeClaude:
 class SyntaxTest(unittest.TestCase):
     def test_scripts_compile_as_lua51(self):
         lua = lua51.LuaRuntime(unpack_returned_tuples=True)
-        for name in ("Foothold_AI_Core.lua", "Foothold_AI_Wingman.lua"):
+        for name in ("Foothold_AI_Core.lua", "Foothold_AI_Wingman.lua", "Foothold_AI_Commander.lua"):
             code = (SCRIPTS / name).read_text(encoding="utf-8")
             ok, err = lua.eval("function(src, name) local f, e = loadstring(src, name) return f ~= nil, e end")(code, name)
             self.assertTrue(ok, f"{name}: {err}")
@@ -141,7 +141,7 @@ class BridgeTest(unittest.TestCase):
 
     def test_ping_pong_roundtrip_with_sidecar(self):
         self.h.advance(10)  # first ping
-        state = json.loads((self.exchange / "state_red.json").read_text(encoding="utf-8"))
+        state = json.loads((self.exchange / "state_red_ping.json").read_text(encoding="utf-8"))
         self.assertEqual(state["schema"], sidecar.STATE_SCHEMA)
         self.assertEqual(state["kind"], "ping")
         self.assertTrue(state["payload"]["wantsClaude"])
@@ -154,7 +154,7 @@ class BridgeTest(unittest.TestCase):
             self.assertIsNotNone(st)
             bridge.handle(side, st)
         self.assertEqual(claude.calls, 2)
-        self.assertTrue((self.exchange / "orders_red.lua").read_text(encoding="utf-8").startswith("return {"))
+        self.assertTrue((self.exchange / "orders_red_pong.lua").read_text(encoding="utf-8").startswith("return {"))
 
         self.h.advance(5)  # poll
         logs = "\n".join(self.h.logs())
@@ -178,7 +178,7 @@ class BridgeTest(unittest.TestCase):
 
     def test_malicious_orders_cannot_call_functions(self):
         self.h.advance(10)
-        (self.exchange / "orders_red.lua").write_text('return { x = os.exit() }', encoding="utf-8")
+        (self.exchange / "orders_red_pong.lua").write_text('return { x = os.exit() }', encoding="utf-8")
         self.h.advance(5)
         self.assertTrue(any("rejected" in line for line in self.h.logs()))
 

@@ -2,8 +2,8 @@
 """Foothold AI sidecar.
 
 Bridges the DCS mission (Foothold_AI_Core.lua) and the local Claude Code CLI.
-The mission writes state_<side>.json into <Saved Games>/DCS/Missions/Saves/FootholdAI;
-this script answers with orders_<side>.lua (a data-only "return { ... }" file),
+The mission writes state_<side>_<kind>.json into <Saved Games>/DCS/Missions/Saves/FootholdAI;
+this script answers with orders_<side>_<kind>.lua (a data-only "return { ... }" file),
 written atomically so the mission never reads a partial file.
 
 Standard library only. Claude is called as:
@@ -27,11 +27,17 @@ import pathlib
 import shutil
 import subprocess
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import commander  # noqa: E402
 
 STATE_SCHEMA = "footholdai.state.v1"
 ORDERS_SCHEMA = "footholdai.orders.v1"
 SIDES = ("red", "blue")
+STATE_KINDS = ("ping", "commander")
 
 log = logging.getLogger("footholdai")
 
@@ -109,8 +115,9 @@ def to_lua(value, indent: int = 0) -> str:
 
 
 def write_orders(exchange: pathlib.Path, side: str, orders: dict) -> None:
-    path = exchange / f"orders_{side}.lua"
-    tmp = exchange / f"orders_{side}.lua.tmp"
+    kind = orders["kind"]
+    path = exchange / f"orders_{side}_{kind}.lua"
+    tmp = exchange / f"orders_{side}_{kind}.lua.tmp"
     tmp.write_text("return " + to_lua(orders) + "\n", encoding="utf-8")
     os.replace(tmp, path)
 
@@ -134,12 +141,13 @@ class ClaudeCli:
         self.timeout = timeout
         self.workdir = workdir
 
-    def call(self, prompt: str, schema: dict, system_prompt_file: pathlib.Path | None = None) -> dict:
+    def call(self, prompt: str, schema: dict, system_prompt_file: pathlib.Path | None = None,
+             effort: str | None = None) -> dict:
         """Run one headless Claude call. Returns the validated structured output plus metadata."""
         args = [
             self.command, "-p",
             "--model", self.model,
-            "--effort", self.effort,
+            "--effort", effort or self.effort,
             "--output-format", "json",
             "--json-schema", json.dumps(schema, separators=(",", ":")),
             "--tools", "",
@@ -189,39 +197,45 @@ def claude_link_test(claude: ClaudeCli) -> dict:
 # ---------------------------------------------------------------------------
 
 class Bridge:
-    def __init__(self, exchange: pathlib.Path, claude: ClaudeCli | None):
+    def __init__(self, exchange: pathlib.Path, claude: ClaudeCli | None, commander_effort: str = "high"):
         self.exchange = exchange
         self.claude = claude
-        self.last_stamp: dict[str, tuple] = {}
-        self.last_seq: dict[str, tuple] = {}
+        self.commander_effort = commander_effort
+        self.last_stamp: dict[tuple, tuple] = {}
+        self.last_seq: dict[tuple, tuple] = {}
         self.order_seq = 0
+        self.seq_lock = threading.Lock()
+        self.pool = ThreadPoolExecutor(max_workers=2)  # one Claude call per side at a time
+        self.busy: set[str] = set()
 
     def next_order_seq(self) -> int:
         # Millisecond clock keeps seq increasing across sidecar restarts.
-        self.order_seq = max(self.order_seq + 1, int(time.time() * 1000))
-        return self.order_seq
+        with self.seq_lock:
+            self.order_seq = max(self.order_seq + 1, int(time.time() * 1000))
+            return self.order_seq
 
-    def read_state(self, side: str) -> dict | None:
-        path = self.exchange / f"state_{side}.json"
+    def read_state(self, side: str, kind: str = "ping") -> dict | None:
+        path = self.exchange / f"state_{side}_{kind}.json"
+        key = (side, kind)
         try:
             stat = path.stat()
         except FileNotFoundError:
             return None
         stamp = (stat.st_mtime_ns, stat.st_size)
-        if self.last_stamp.get(side) == stamp:
+        if self.last_stamp.get(key) == stamp:
             return None
         try:
             state = json.loads(path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, UnicodeDecodeError, OSError):
             return None  # mission is mid-write; retry on the next poll
-        self.last_stamp[side] = stamp
-        if state.get("schema") != STATE_SCHEMA or state.get("side") != side:
-            log.warning("ignoring %s: unexpected schema/side", path.name)
+        self.last_stamp[key] = stamp
+        if state.get("schema") != STATE_SCHEMA or state.get("side") != side or state.get("kind") != kind:
+            log.warning("ignoring %s: unexpected schema/side/kind", path.name)
             return None
-        key = (state.get("session"), state.get("seq"))
-        if self.last_seq.get(side) == key:
+        seq_key = (state.get("session"), state.get("seq"))
+        if self.last_seq.get(key) == seq_key:
             return None
-        self.last_seq[side] = key
+        self.last_seq[key] = seq_key
         return state
 
     def handle(self, side: str, state: dict) -> None:
@@ -254,16 +268,46 @@ class Bridge:
                 log.error("%s: Claude link test failed: %s", side, exc)
         return {"kind": "pong", "claude": claude_info}
 
+    def on_commander(self, side: str, state: dict) -> dict | None:
+        if not self.claude:
+            log.info("%s: commander request seq=%s skipped (dry run)", side, state.get("seq"))
+            return None
+        reason = (state.get("payload") or {}).get("reason")
+        log.info("%s: commander request seq=%s reason=%s - asking Claude", side, state.get("seq"), reason)
+        orders = commander.handle(self.claude, self.exchange, side, state, self.commander_effort)
+        log.info("%s: commander plans=%s summary=%s", side,
+                 [p["name"] for p in orders["plans"]], orders["summary"])
+        return orders
+
+    def _handle_async(self, side: str, state: dict) -> None:
+        try:
+            self.handle(side, state)
+        except Exception:
+            log.exception("%s: commander request seq=%s failed", side, state.get("seq"))
+        finally:
+            self.busy.discard(side)
+
+    def poll_once(self) -> None:
+        for side in SIDES:
+            for kind in STATE_KINDS:
+                if kind == "commander" and side in self.busy:
+                    continue  # newer request is read after the running call finishes
+                state = self.read_state(side, kind)
+                if not state:
+                    continue
+                if kind == "commander":
+                    self.busy.add(side)
+                    self.pool.submit(self._handle_async, side, state)
+                    continue
+                try:
+                    self.handle(side, state)
+                except Exception:
+                    log.exception("%s: failed to handle %s seq=%s", side, kind, state.get("seq"))
+
     def run(self, poll_sec: float) -> None:
         log.info("watching %s", self.exchange)
         while True:
-            for side in SIDES:
-                state = self.read_state(side)
-                if state:
-                    try:
-                        self.handle(side, state)
-                    except Exception:
-                        log.exception("%s: failed to handle state seq=%s", side, state.get("seq"))
+            self.poll_once()
             time.sleep(poll_sec)
 
 
@@ -277,7 +321,10 @@ def main(argv: list[str] | None = None) -> int:
                         help="DCS Saved Games folder (default: %%USERPROFILE%%\\Saved Games\\DCS)")
     parser.add_argument("--claude", default="claude", help="Claude Code executable (default: claude)")
     parser.add_argument("--model", default="opus", help="Claude model alias (default: opus)")
-    parser.add_argument("--effort", default="medium", choices=["low", "medium", "high", "xhigh", "max"])
+    parser.add_argument("--effort", default="medium", choices=["low", "medium", "high", "xhigh", "max"],
+                        help="effort for link tests (default: medium)")
+    parser.add_argument("--commander-effort", default="high", choices=["low", "medium", "high", "xhigh", "max"],
+                        help="effort for commander plans (default: high)")
     parser.add_argument("--timeout", type=float, default=300.0, help="seconds per Claude call")
     parser.add_argument("--poll", type=float, default=2.0, help="seconds between state polls")
     parser.add_argument("--dry-run", action="store_true", help="never call Claude")
@@ -309,7 +356,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     try:
-        Bridge(exchange, claude).run(args.poll)
+        Bridge(exchange, claude, args.commander_effort).run(args.poll)
     except KeyboardInterrupt:
         log.info("stopped")
     return 0

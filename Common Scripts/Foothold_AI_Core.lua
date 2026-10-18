@@ -50,6 +50,28 @@ FAI.defaults = {
 		-- Add task = 'CAS' (or another DCS main task) to change the group task.
 		typeOverride = {},
 	},
+	commander = {
+		enabled = true,
+		sides = { 'red', 'blue' },
+		firstRequestSec = 120,   -- after the Director reports ready
+		intervalSec = 900,       -- regular re-plan
+		eventMinIntervalSec = 240, -- earliest re-plan after a zone changes hands
+		retrySec = 600,          -- ask again if no answer arrived
+		planTtlSec = 1800,       -- a plan stops steering after this long without renewal
+		maxCandidates = 12,
+		maxAreas = 8,
+		maxContacts = 25,
+		maxEvents = 12,
+		announceBlue = true,     -- show BLUE HQ intent to BLUE players
+		bias = {
+			minWeight = 0.25,
+			maxWeight = 4,
+			avoidWeight = 0.2,
+			reinforceBonus = 150,
+			capBonus = 250,
+			blueFocusBonus = 150,
+		},
+	},
 }
 
 local function deepMerge(base, override)
@@ -203,15 +225,17 @@ end
 
 ---------------------------------------------------------------------------
 -- Mailbox
--- Lua writes state_<side>.json; the sidecar answers with orders_<side>.lua,
--- a data-only file ("return { ... }") written atomically. Orders are loaded
--- with an empty environment and dispatched by kind to registered handlers.
+-- Lua writes state_<side>_<kind>.json; the sidecar answers with
+-- orders_<side>_<kind>.lua, a data-only file ("return { ... }") written
+-- atomically. One file per kind, so a ping never overwrites a pending
+-- commander request. Orders are loaded with an empty environment and passed
+-- to the handler registered for their kind.
 ---------------------------------------------------------------------------
 
 FAI.bridge = {
 	seq = { red = 0, blue = 0 },
-	lastOrderSeq = { red = 0, blue = 0 },
-	lastOrderStamp = { red = nil, blue = nil },
+	lastOrderSeq = {},   -- [side:kind] = seq
+	lastOrderStamp = {}, -- [side:kind] = mtime:size
 	handlers = {},
 	pendingPings = {},
 	linkOk = { red = false, blue = false },
@@ -242,7 +266,7 @@ function bridge.writeState(side, kind, payload)
 		FAI.warn('bridge', 'state encode failed for %s/%s: %s', side, kind, tostring(text))
 		return nil
 	end
-	local path = FAI.dir .. 'state_' .. side .. '.json'
+	local path = FAI.dir .. 'state_' .. side .. '_' .. kind .. '.json'
 	local f, err = io.open(path, 'w')
 	if not f then
 		FAI.warn('bridge', 'cannot write %s: %s', path, tostring(err))
@@ -254,19 +278,21 @@ function bridge.writeState(side, kind, payload)
 	return state.seq
 end
 
-local function readOrders(side)
-	local path = FAI.dir .. 'orders_' .. side .. '.lua'
+local function readOrders(side, kind)
+	local key = side .. ':' .. kind
+	local path = FAI.dir .. 'orders_' .. side .. '_' .. kind .. '.lua'
 	local attr = lfs.attributes(path)
 	if not attr then return end
 	local stamp = tostring(attr.modification) .. ':' .. tostring(attr.size)
-	if stamp == bridge.lastOrderStamp[side] then return end
-	bridge.lastOrderStamp[side] = stamp
+	if stamp == bridge.lastOrderStamp[key] then return end
+	bridge.lastOrderStamp[key] = stamp
 	local orders, err = loadDataFile(path)
 	if not orders then
 		FAI.warn('bridge', 'rejected %s: %s', path, tostring(err))
 		return
 	end
-	if orders.schema ~= 'footholdai.orders.v1' or orders.side ~= side or type(orders.seq) ~= 'number' then
+	if orders.schema ~= 'footholdai.orders.v1' or orders.side ~= side or orders.kind ~= kind
+		or type(orders.seq) ~= 'number' then
 		FAI.warn('bridge', 'rejected %s: bad header', path)
 		return
 	end
@@ -274,21 +300,18 @@ local function readOrders(side)
 		FAI.debug('bridge', 'ignored %s from another mission session', path)
 		return
 	end
-	if orders.seq <= (bridge.lastOrderSeq[side] or 0) then return end
-	bridge.lastOrderSeq[side] = orders.seq
-	local handler = bridge.handlers[orders.kind]
-	if not handler then
-		FAI.warn('bridge', 'no handler for order kind %s (%s)', tostring(orders.kind), side)
-		return
-	end
-	local ok, herr = pcall(handler, side, orders)
-	if not ok then FAI.warn('bridge', 'handler %s failed: %s', tostring(orders.kind), tostring(herr)) end
+	if orders.seq <= (bridge.lastOrderSeq[key] or 0) then return end
+	bridge.lastOrderSeq[key] = orders.seq
+	local ok, herr = pcall(bridge.handlers[kind], side, orders)
+	if not ok then FAI.warn('bridge', 'handler %s failed: %s', kind, tostring(herr)) end
 end
 
 function bridge.poll()
 	for _, side in ipairs(FAI.config.bridge.sides) do
-		local ok, err = pcall(readOrders, side)
-		if not ok then FAI.warn('bridge', 'poll %s failed: %s', side, tostring(err)) end
+		for kind in pairs(bridge.handlers) do
+			local ok, err = pcall(readOrders, side, kind)
+			if not ok then FAI.warn('bridge', 'poll %s/%s failed: %s', side, kind, tostring(err)) end
+		end
 	end
 end
 
