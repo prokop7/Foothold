@@ -43,6 +43,17 @@ FAI.defaults = {
 		attackAutoRejoinSec = 600,
 		markPrefix = 'wm',
 		markMaxDistanceNm = 60,
+		-- Plain-language orders to your wingman: an F10 map mark "wm <order>" (the mark is
+		-- "here" in the order), or chat "wm <order>" with the chat hook installed. Claude
+		-- turns the words into wingman actions (needs the sidecar).
+		naturalLanguage = {
+			enabled = true,
+			chatInbox = true,        -- read chat_inbox.lua written by the optional chat hook
+			chatPrefixes = { 'wm ', 'wingman ' },
+			contextRadiusNm = 80,    -- zones Claude is told about around you
+			maxPending = 3,          -- per side
+			timeoutSec = 90,
+		},
 		removeAfterLandingSec = 60,
 		-- [playerType] = false disables wingmen for that type.
 		-- [playerType] = { template = 'ME group name' } uses an existing AI
@@ -115,6 +126,8 @@ FAI.defaults = {
 			orbitSpeedMps = 180,
 			heloOrbitSpeedMps = 45,
 			flagBase = 77000,       -- user flags that release holding flights
+			playerAtIpNm = 5,       -- a player counts as holding within this distance of the IP
+			markBase = 7700000,     -- F10 map mark ids for package IPs and targets
 			keepMin = 30,           -- how long a pushed package stays in the snapshot
 		},
 		eventCooldownSec = 3600,        -- per scripted event

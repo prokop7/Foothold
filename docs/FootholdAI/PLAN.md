@@ -94,7 +94,7 @@ Denied launches (e.g. runway blocked, origin lost) are cleaned up like the Direc
 | 3 | Credit economy and RED player-like operations (waves 1 and 2 of [RED_TOOLKIT.md](RED_TOOLKIT.md)) | done (batch 3) |
 | 3b | Wave 3: recon → intel, hunting BLUE FARPs and CTLD sites, RED forward FARPs | planned |
 | 4 | Package timing in Lua: IP hold and push time, so packages hit together regardless of start-up delays (`Foothold_AI_Packages.lua`) | done (batch 4) |
-| 5 | Player joins AI packages; natural-language wingman | planned |
+| 5 | Players join AI packages (F10 "AI Packages": list, join, push now, request support); plain-language wingman orders by F10 map mark or chat | done (batch 5) |
 
 ## Things that must be checked in DCS, not assumed
 

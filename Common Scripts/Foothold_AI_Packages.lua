@@ -6,6 +6,11 @@
 -- and continue their own Foothold mission, so they reach the target together
 -- whatever their start-up and taxi times were.
 --
+-- Players join a package from the F10 "AI Packages" menu (phase 5): they get
+-- the IP and target on their F10 map, the AI waits at the IP for them, they
+-- hear the push call, and a player in the package can call the push himself.
+-- Players can also ask their side's Claude commander for support.
+--
 -- How a flight holds: an Orbit is pushed on top of the flight's mission
 -- (Controller.pushTask) as a ControlledTask that ends by itself at the release
 -- time, or earlier when the flight's user flag is set. When it ends, DCS resumes
@@ -27,6 +32,8 @@ local P = {
 	bySide = { red = {}, blue = {} },   -- [sideName][packageId] = package
 	holding = {},                        -- [live group name] = member
 	flagCounter = 0,
+	markCounter = 0,
+	menus = {},                          -- [player group name] = true
 }
 X.packages = P
 
@@ -163,12 +170,16 @@ local function updatePackage(sideName, pkg)
 		local ok, err = pcall(updateMember, pkg, m)
 		if not ok then FAI.warn('packages', '%s member %s: %s', pkg.id, tostring(m.order), tostring(err)) end
 	end
+	P.updatePlayers(sideName, pkg)
 	if pkg.pushed then return end
-	-- Push early once every flight still flying is holding at the IP.
-	if pkg.pushWhenReady and #pkg.members > 0 and t < pkg.pushAt then
+	-- Push early once every flight still flying (players included) is holding at the IP.
+	if pkg.pushWhenReady and t < pkg.pushAt then
 		local holding, waiting = 0, 0
 		for _, m in ipairs(pkg.members) do
 			if m.state == 'holding' then holding = holding + 1 elseif m.state == 'waiting' then waiting = waiting + 1 end
+		end
+		for _, pl in pairs(pkg.players) do
+			if pl.state == 'at_ip' then holding = holding + 1 elseif pl.state == 'joined' then waiting = waiting + 1 end
 		end
 		if holding > 0 and waiting == 0 then
 			local early = t + cfg.pushWhenReadyDelaySec
@@ -184,6 +195,7 @@ local function updatePackage(sideName, pkg)
 			lost = (counts.lost or 0) + (counts.aborted or 0) })
 		X.eventPending[sideName] = true
 		FAI.log('packages', '%s package %s pushed on %s', sideName, pkg.id, tostring(pkg.target))
+		P.announcePush(pkg)
 	end
 end
 
@@ -196,7 +208,10 @@ local function tick()
 			for _, m in ipairs(pkg.members) do
 				if not TERMINAL[m.state] and m.state ~= 'waiting' then done = false end
 			end
-			if done and t - pkg.pushAt > cfg.keepMin * 60 then list[id] = nil end
+			if done and t - pkg.pushAt > cfg.keepMin * 60 then
+				for _, pl in pairs(pkg.players) do P.removeMarks(pl) end
+				list[id] = nil
+			end
 		end
 	end
 end
@@ -283,7 +298,7 @@ local function createPackage(side, order)
 		id = id, side = side, target = target.zone, targetPoint = { x = tp.x, z = tp.z }, ipNm = ipNm,
 		ip = toward(tp, zonePoint(from), ipNm * NM), ipFrom = from.zone,
 		pushAt = now() + pushMin * 60, pushWhenReady = order.pushWhenReady ~= false,
-		members = {}, createdAt = now(),
+		members = {}, players = {}, createdAt = now(),
 	}
 	pkg.ipDist = dist2(pkg.ip, pkg.targetPoint)   -- shorter than ipNm when the own zone is closer
 	P.bySide[sideName][id] = pkg
@@ -332,6 +347,283 @@ for _, kind in ipairs({ 'launch_capability', 'launch_mission' }) do
 end
 
 ---------------------------------------------------------------------------
+-- Players (phase 5): join a package from the F10 menu, hear the push.
+---------------------------------------------------------------------------
+
+local function groupMsg(groupName, text, seconds)
+	local g = Group.getByName(groupName)
+	if g and g:isExist() then trigger.action.outTextForGroup(g:getID(), text, seconds or 15) end
+end
+
+local function playerUnitOf(g)
+	for _, u in ipairs(g:getUnits() or {}) do
+		if u and u:isExist() and u:getPlayerName() then return u end
+	end
+	return nil
+end
+
+local function bearingDeg(from, to)
+	return math.floor((math.deg(math.atan2(to.z - from.z, to.x - from.x)) + 360) % 360 + 0.5)
+end
+
+-- "045 for 32 nm" from the player's position to a point.
+local function braa(groupName, point)
+	local g = Group.getByName(groupName)
+	local u = g and g:isExist() and playerUnitOf(g)
+	if not u then return '?' end
+	local p = u:getPoint()
+	return string.format('%03d for %d nm', bearingDeg(p, point), math.floor(dist2(p, point) / NM + 0.5))
+end
+
+local function openPackages(sideName)
+	local list = {}
+	for _, pkg in pairs(P.bySide[sideName] or {}) do
+		if not pkg.pushed then list[#list + 1] = pkg end
+	end
+	table.sort(list, function(a, c) return a.id < c.id end)
+	return list
+end
+
+local function playerSide(groupName)
+	local g = Group.getByName(groupName)
+	if not (g and g:isExist()) then return nil end
+	return SIDE_NAME[g:getCoalition()], g
+end
+
+local function packageOfPlayer(groupName)
+	for _, list in pairs(P.bySide) do
+		for _, pkg in pairs(list) do
+			local pl = pkg.players[groupName]
+			if pl and pl.state ~= 'left' and not pkg.pushed then return pkg, pl end
+		end
+	end
+	return nil
+end
+
+function P.removeMarks(pl)
+	for _, id in ipairs(pl.marks or {}) do pcall(trigger.action.removeMark, id) end
+	pl.marks = {}
+end
+
+local function addMark(pl, g, text, point)
+	P.markCounter = P.markCounter + 1
+	local id = cfg.markBase + P.markCounter
+	local ok = pcall(trigger.action.markToGroup, id, text, { x = point.x, y = land.getHeight({ x = point.x, y = point.z }), z = point.z },
+		g:getID(), true)
+	if ok then pl.marks[#pl.marks + 1] = id end
+end
+
+local function flightsLine(pkg)
+	local roles = {}
+	for _, m in ipairs(pkg.members) do
+		if m.state ~= 'aborted' and m.state ~= 'lost' then
+			roles[#roles + 1] = tostring(m.role or '?') .. (m.offsetSec ~= 0 and string.format(' %+d', m.offsetSec / 60) or '')
+		end
+	end
+	return #roles > 0 and table.concat(roles, ', ') or 'no AI flights yet'
+end
+
+function P.listFor(groupName)
+	local sideName = playerSide(groupName)
+	if not sideName then return end
+	local list = openPackages(sideName)
+	if #list == 0 then
+		groupMsg(groupName, 'No AI packages are planned right now. Use AI Packages > Request support to ask for one.')
+		return
+	end
+	local lines = { 'AI packages (F10 > AI Packages > Join):' }
+	for i, pkg in ipairs(list) do
+		if i > 6 then break end
+		lines[#lines + 1] = string.format('%d. %s on %s, push in %d min, IP %s from you. Flights: %s', i, pkg.id, pkg.target,
+			math.max(0, math.ceil((pkg.pushAt - now()) / 60)), braa(groupName, pkg.ip), flightsLine(pkg))
+	end
+	groupMsg(groupName, table.concat(lines, '\n'), 25)
+end
+
+function P.join(groupName, index)
+	local sideName, g = playerSide(groupName)
+	if not sideName then return end
+	local pkg = openPackages(sideName)[index]
+	if not pkg then
+		groupMsg(groupName, 'There is no package ' .. tostring(index) .. '. Use AI Packages > List packages.')
+		return
+	end
+	local current = packageOfPlayer(groupName)
+	if current and current ~= pkg then P.leave(groupName, true) end
+	local u = playerUnitOf(g)
+	local pl = pkg.players[groupName] or { marks = {} }
+	pl.group, pl.state = groupName, 'joined'
+	pl.playerName = u and u:getPlayerName() or '?'
+	pl.type = u and u:getTypeName() or '?'
+	pl.warned = {}
+	pkg.players[groupName] = pl
+	P.removeMarks(pl)
+	addMark(pl, g, string.format('%s IP - hold here, push in %d min', pkg.id, math.max(0, math.ceil((pkg.pushAt - now()) / 60))), pkg.ip)
+	addMark(pl, g, string.format('%s target: %s', pkg.id, pkg.target), pkg.targetPoint)
+	groupMsg(groupName, string.format('Joined %s on %s. IP %s (marked on your F10 map), push in %d min. AI flights: %s.%s',
+		pkg.id, pkg.target, braa(groupName, pkg.ip), math.max(0, math.ceil((pkg.pushAt - now()) / 60)), flightsLine(pkg),
+		pkg.pushWhenReady and ' The package pushes early once everyone, you included, is at the IP.' or ''), 25)
+	X.event(sideName, 'player_joined_package', { package = pkg.id, player = pl.playerName, aircraft = pl.type })
+	FAI.log('packages', '%s joined package %s', pl.playerName, pkg.id)
+end
+
+function P.leave(groupName, quiet)
+	local pkg, pl = packageOfPlayer(groupName)
+	if not pkg then
+		if not quiet then groupMsg(groupName, 'You are not in a package.') end
+		return
+	end
+	pl.state = 'left'
+	P.removeMarks(pl)
+	if not quiet then groupMsg(groupName, 'Left package ' .. pkg.id .. '.') end
+end
+
+function P.statusFor(groupName)
+	local pkg, pl = packageOfPlayer(groupName)
+	if not pkg then
+		groupMsg(groupName, 'You are not in a package. AI Packages > List packages shows what is planned.')
+		return
+	end
+	local lines = { string.format('%s on %s: push in %d min, IP %s, you are %s.', pkg.id, pkg.target,
+		math.max(0, math.ceil((pkg.pushAt - now()) / 60)), braa(groupName, pkg.ip), pl.state == 'at_ip' and 'at the IP' or 'en route') }
+	for _, m in ipairs(pkg.members) do
+		lines[#lines + 1] = string.format('  %s: %s', tostring(m.role), m.state)
+	end
+	for _, other in pairs(pkg.players) do
+		if other ~= pl and other.state ~= 'left' then lines[#lines + 1] = string.format('  %s (%s): %s', other.playerName, other.type, other.state) end
+	end
+	groupMsg(groupName, table.concat(lines, '\n'), 20)
+end
+
+-- A player in the package calls the push: every holding flight leaves the IP now
+-- (plus its offset).
+function P.pushNow(groupName)
+	local pkg, pl = packageOfPlayer(groupName)
+	if not pkg then
+		groupMsg(groupName, 'You are not in a package.')
+		return
+	end
+	pkg.pushAt, pkg.pushedBy = now(), pl.playerName
+	updatePackage(SIDE_NAME[pkg.side], pkg)
+end
+
+function P.announcePush(pkg)
+	for groupName, pl in pairs(pkg.players) do
+		local g = Group.getByName(groupName)
+		if pl.state ~= 'left' and g and g:isExist() then
+			groupMsg(groupName, string.format('%s, PUSH PUSH%s. Flights: %s. Target %s %s.', pkg.id,
+				pkg.pushedBy and (' (called by ' .. pkg.pushedBy .. ')') or '', flightsLine(pkg), pkg.target,
+				braa(groupName, pkg.targetPoint)), 20)
+			pl.state = 'pushed'
+			P.removeMarks(pl)
+			addMark(pl, g, string.format('%s target: %s', pkg.id, pkg.target), pkg.targetPoint)
+		end
+	end
+end
+
+function P.updatePlayers(sideName, pkg)
+	local t = now()
+	for groupName, pl in pairs(pkg.players) do
+		local g = Group.getByName(groupName)
+		local u = g and g:isExist() and playerUnitOf(g)
+		if pl.state ~= 'left' and not u then
+			pl.state = 'left'   -- left the slot, died or landed out
+			P.removeMarks(pl)
+		elseif u and not pkg.pushed then
+			if pl.state == 'joined' and dist2(u:getPoint(), pkg.ip) <= cfg.playerAtIpNm * NM then
+				pl.state = 'at_ip'
+				groupMsg(groupName, string.format('%s: at the IP, hold. Push in %d min.', pkg.id,
+					math.max(0, math.ceil((pkg.pushAt - t) / 60))))
+			end
+			for _, mins in ipairs({ 5, 1 }) do
+				local left = pkg.pushAt - t
+				if left <= mins * 60 and left > (mins * 60 - 30) and not pl.warned[mins] then
+					pl.warned[mins] = true
+					groupMsg(groupName, string.format('%s: push in %d minute%s.', pkg.id, mins, mins > 1 and 's' or ''))
+				end
+			end
+		end
+	end
+end
+
+-- Players ask their side's Claude commander for support; it plans it next cycle.
+local SUPPORT = { sead = 'SEAD on the air defences near me', cap = 'CAP cover over me',
+	cas = 'CAS on the enemy near me', strike = 'a strike package on the nearest enemy zone' }
+
+function P.requestSupport(groupName, kind)
+	local sideName, g = playerSide(groupName)
+	if not sideName then return end
+	local u = playerUnitOf(g)
+	if not u then return end
+	if not X.controls(SIDE_ID[sideName]) then
+		groupMsg(groupName, 'No AI commander for your side in this mission.')
+		return
+	end
+	local last = P.lastRequestAt and P.lastRequestAt[groupName] or -1e9
+	if now() - last < 120 then
+		groupMsg(groupName, 'HQ: we have your request, stand by.')
+		return
+	end
+	P.lastRequestAt = P.lastRequestAt or {}
+	P.lastRequestAt[groupName] = now()
+	local p = u:getPoint()
+	local nearestEnemy, bestD
+	for _, z in ipairs(U.bcObj().zones or {}) do
+		local zp = z.active and not z.isHidden and z.side ~= 0 and z.side ~= g:getCoalition() and zonePoint(z)
+		if zp then
+			local d = dist2(zp, p)
+			if not bestD or d < bestD then nearestEnemy, bestD = z.zone, d end
+		end
+	end
+	X.event(sideName, 'player_request', { player = u:getPlayerName(), aircraft = u:getTypeName(), wants = kind,
+		nearestEnemyZone = nearestEnemy, distanceNm = bestD and math.floor(bestD / NM + 0.5) or nil,
+		playerXKm = round(p.x / 1000, 0.1), playerZKm = round(p.z / 1000, 0.1) })
+	X.eventPending[sideName] = true
+	groupMsg(groupName, string.format('HQ: copy, %s. Planning; check AI Packages > List packages in a few minutes.', SUPPORT[kind]))
+end
+
+local function addPlayerMenus(groupName)
+	if P.menus[groupName] then return end
+	local mg = GROUP:FindByName(groupName)
+	if not mg then return end
+	P.menus[groupName] = true
+	local root = MENU_GROUP:New(mg, 'AI Packages')
+	MENU_GROUP_COMMAND:New(mg, 'List packages', root, P.listFor, groupName)
+	local join = MENU_GROUP:New(mg, 'Join', root)
+	for i = 1, 6 do MENU_GROUP_COMMAND:New(mg, 'Package ' .. i, join, P.join, groupName, i) end
+	MENU_GROUP_COMMAND:New(mg, 'My package status', root, P.statusFor, groupName)
+	MENU_GROUP_COMMAND:New(mg, 'Push now', root, P.pushNow, groupName)
+	MENU_GROUP_COMMAND:New(mg, 'Leave package', root, P.leave, groupName)
+	local req = MENU_GROUP:New(mg, 'Request support', root)
+	MENU_GROUP_COMMAND:New(mg, 'SEAD', req, P.requestSupport, groupName, 'sead')
+	MENU_GROUP_COMMAND:New(mg, 'CAP cover', req, P.requestSupport, groupName, 'cap')
+	MENU_GROUP_COMMAND:New(mg, 'CAS', req, P.requestSupport, groupName, 'cas')
+	MENU_GROUP_COMMAND:New(mg, 'Strike package', req, P.requestSupport, groupName, 'strike')
+end
+
+local function setupPlayer(unit)
+	if not (unit and unit:isExist() and unit:getPlayerName()) then return end
+	local g = unit:getGroup()
+	local cat = g and g:getCategory()
+	if cat ~= Group.Category.AIRPLANE and cat ~= Group.Category.HELICOPTER then return end
+	local name = g:getName()
+	timer.scheduleFunction(function()
+		local ok, err = pcall(addPlayerMenus, name)
+		if not ok then FAI.warn('packages', 'menu setup failed for %s: %s', name, tostring(err)) end
+	end, nil, timer.getTime() + 3)
+end
+
+world.addEventHandler({ onEvent = function(_, e)
+	if e and e.id == world.event.S_EVENT_BIRTH and e.initiator then
+		local ok, err = pcall(setupPlayer, e.initiator)
+		if not ok then FAI.warn('packages', 'birth handling failed: %s', tostring(err)) end
+	end
+end })
+for _, side in ipairs({ coalition.side.RED, coalition.side.BLUE }) do
+	for _, unit in ipairs(coalition.getPlayers(side) or {}) do pcall(setupPlayer, unit) end
+end
+
+---------------------------------------------------------------------------
 -- Snapshot and timer
 ---------------------------------------------------------------------------
 
@@ -345,8 +637,13 @@ X.snapshotExtensions[#X.snapshotExtensions + 1] = function(sideName, payload)
 				pushOffsetMin = m.offsetSec ~= 0 and round(m.offsetSec / 60) or nil,
 				holdingMin = m.state == 'holding' and round((t - m.holdingSince) / 60) or nil }
 		end
+		local players = {}
+		for _, pl in pairs(pkg.players) do
+			if pl.state ~= 'left' then players[#players + 1] = { player = pl.playerName, aircraft = pl.type, state = pl.state } end
+		end
 		rows[#rows + 1] = {
 			package = id, target = pkg.target, ipNm = pkg.ipNm, ipToward = pkg.ipFrom,
+			players = #players > 0 and FAI.json.array(players) or nil,
 			pushInMin = not pkg.pushed and math.max(0, math.ceil((pkg.pushAt - t) / 60)) or nil,
 			pushedMinAgo = pkg.pushed and round((t - pkg.pushAt) / 60) or nil,
 			members = FAI.json.array(members),

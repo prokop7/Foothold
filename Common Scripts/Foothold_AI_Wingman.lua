@@ -2,7 +2,9 @@
 -- Foothold AI - wingman
 -- F10 "AI Wingman" menu for players. A wingman is a copy of the player's
 -- own slot template (same type, default loadout, livery), air-started behind
--- the player and driven with native DCS tasks. No LLM involved.
+-- the player and driven with native DCS tasks. Players can also give orders in
+-- plain words (F10 map mark or chat "wm <order>"); Claude turns them into the
+-- same actions through the sidecar.
 ---------------------------------------------------------------------------
 
 local FAI = FootholdAI
@@ -371,6 +373,55 @@ local function requestWingmen(playerGroupName, count)
 	end, nil, timer.getTime() + 1)
 end
 
+local TYPES_BY_KIND = {
+	ground = { 'Ground Units' },
+	airDefence = { 'Air Defence' },
+	ships = { 'Ships' },
+	mark = { 'Ground Units', 'Ships' },
+	any = { 'Ground Units', 'Ships' },
+}
+
+-- Engage targets of `kind` within radiusNm of center, then rejoin after a while.
+local function attackAt(flight, pg, center, kind, radiusNm, label)
+	local wg = wingmanGroup(flight)
+	local lead = wg:getUnit(1)
+	local task = {
+		id = 'ComboTask',
+		params = { tasks = {
+			{
+				id = 'EngageTargetsInZone',
+				params = {
+					point = { x = center.x, y = center.z },
+					zoneRadius = radiusNm * NM,
+					targetTypes = TYPES_BY_KIND[kind] or TYPES_BY_KIND.ground,
+					priority = 0,
+				},
+			},
+			orbitTask(center, orbitAltitude(flight.cat, center, lead:getPoint().y), orbitSpeed(flight.cat)),
+		} },
+	}
+	wg:getController():setTask(task)
+	setROE(wg, ROE.WEAPON_FREE)
+	local token = setMode(flight, 'attack')
+	msg(pg:getID(), string.format('Engaging %s targets within %d nm of %s.',
+		kind == 'airDefence' and 'air defence' or ((kind == 'mark' or kind == 'any') and 'ground' or kind), radiusNm, label))
+	FAI.log('wingman', '%s attack kind=%s radiusNm=%d', flight.groupName, kind, radiusNm)
+	timer.scheduleFunction(function()
+		if W.flights[flight.playerGroupName] == flight and flight.modeToken == token and joinUp(flight, false) then
+			local g = playerGroupOf(flight)
+			if g then msg(g:getID(), 'Attack time is up, rejoining.') end
+		end
+	end, nil, timer.getTime() + cfg.attackAutoRejoinSec)
+end
+
+local function holdAt(flight, pg, point, label)
+	local wg = wingmanGroup(flight)
+	local lead = wg:getUnit(1)
+	wg:getController():setTask(orbitTask(point, orbitAltitude(flight.cat, point, lead:getPoint().y), orbitSpeed(flight.cat)))
+	setMode(flight, 'hold')
+	msg(pg:getID(), 'Holding at ' .. label .. '.')
+end
+
 local function attackNear(playerGroupName, kind)
 	withFlight(playerGroupName, function(flight, pg)
 		local wg = wingmanGroup(flight)
@@ -395,51 +446,13 @@ local function attackNear(playerGroupName, kind)
 			if not pu then return end
 			center, label = pu:getPoint(), 'your position'
 		end
-		local typesByKind = {
-			ground = { 'Ground Units' },
-			airDefence = { 'Air Defence' },
-			ships = { 'Ships' },
-			mark = { 'Ground Units', 'Ships' },
-		}
-		local radiusNm = cfg.attackRadiusNm[kind]
-		local lead = wg:getUnit(1)
-		local task = {
-			id = 'ComboTask',
-			params = { tasks = {
-				{
-					id = 'EngageTargetsInZone',
-					params = {
-						point = { x = center.x, y = center.z },
-						zoneRadius = radiusNm * NM,
-						targetTypes = typesByKind[kind],
-						priority = 0,
-					},
-				},
-				orbitTask(center, orbitAltitude(flight.cat, center, lead:getPoint().y), orbitSpeed(flight.cat)),
-			} },
-		}
-		wg:getController():setTask(task)
-		setROE(wg, ROE.WEAPON_FREE)
-		local token = setMode(flight, 'attack')
-		msg(pg:getID(), string.format('Engaging %s targets within %d nm of %s.',
-			kind == 'airDefence' and 'air defence' or (kind == 'mark' and 'ground' or kind), radiusNm, label))
-		FAI.log('wingman', '%s attack kind=%s radiusNm=%d', flight.groupName, kind, radiusNm)
-		timer.scheduleFunction(function()
-			if W.flights[flight.playerGroupName] == flight and flight.modeToken == token and joinUp(flight, false) then
-				local g = playerGroupOf(flight)
-				if g then msg(g:getID(), 'Attack time is up, rejoining.') end
-			end
-		end, nil, timer.getTime() + cfg.attackAutoRejoinSec)
+		attackAt(flight, pg, center, kind, cfg.attackRadiusNm[kind], label)
 	end)
 end
 
 local function holdHere(playerGroupName)
 	withFlight(playerGroupName, function(flight, pg)
-		local wg = wingmanGroup(flight)
-		local p = wg:getUnit(1):getPoint()
-		wg:getController():setTask(orbitTask(p, orbitAltitude(flight.cat, p, p.y), orbitSpeed(flight.cat)))
-		setMode(flight, 'hold')
-		msg(pg:getID(), 'Holding at present position.')
+		holdAt(flight, pg, wingmanGroup(flight):getUnit(1):getPoint(), 'present position')
 	end)
 end
 
@@ -484,6 +497,285 @@ local function dismiss(playerGroupName)
 		msg(pg:getID(), 'Wingmen dismissed.')
 	end)
 end
+
+---------------------------------------------------------------------------
+-- Plain-language orders. The player writes "wm <order>" on an F10 map mark
+-- (the mark is "here") or in chat (with the chat hook). The request goes to the
+-- sidecar, Claude answers with a short radio reply and a list of the actions
+-- above, and they are carried out here.
+---------------------------------------------------------------------------
+
+local nl = cfg.naturalLanguage or {}
+W.nl = { pending = {}, counter = 0, chatSeq = nil, seenMarks = {} }
+local SIDE_KEY = { [coalition.side.RED] = 'red', [coalition.side.BLUE] = 'blue' }
+
+local function bearingDeg(from, to)
+	return math.floor((math.deg(math.atan2(to.z - from.z, to.x - from.x)) + 360) % 360 + 0.5)
+end
+
+local function zonePointByName(name)
+	local ok, cz = pcall(CustomZone.getByName, CustomZone, name)
+	return ok and cz and cz.point or nil
+end
+
+local function zonesNear(point)
+	local out = {}
+	local b = bc
+	for _, z in ipairs(b and b.zones or {}) do
+		local zp = z.active and not z.isHidden and zonePointByName(z.zone)
+		if zp then
+			local d = distance2D(point, zp) / NM
+			if d <= (nl.contextRadiusNm or 80) then
+				out[#out + 1] = { name = z.zone, side = SIDE_KEY[z.side] or 'neutral', bearingDeg = bearingDeg(point, zp),
+					distanceNm = math.floor(d + 0.5) }
+			end
+		end
+	end
+	table.sort(out, function(a, c) return a.distanceNm < c.distanceNm end)
+	while #out > 15 do table.remove(out) end
+	return out
+end
+
+local function flightSummary(flight)
+	local wg = wingmanGroup(flight)
+	if not wg then return nil end
+	local units = {}
+	for _, unit in ipairs(wg:getUnits() or {}) do
+		local ammo = {}
+		for _, a in ipairs(unit:getAmmo() or {}) do
+			local d = a.desc or {}
+			ammo[#ammo + 1] = string.format('%dx %s', a.count or 0, tostring(d.displayName or d.typeName))
+		end
+		units[#units + 1] = { fuelPct = math.floor((unit:getFuel() or 0) * 100), weapons = FAI.json.array(ammo) }
+	end
+	return { mode = flight.mode, aircraft = FAI.json.array(units) }
+end
+
+local function writeRequests(sideName)
+	local list = {}
+	for _, req in pairs(W.nl.pending) do
+		if req.side == sideName then list[#list + 1] = req.payload end
+	end
+	table.sort(list, function(a, c) return a.id < c.id end)
+	return FAI.bridge.writeState(sideName, 'wingman', { requests = FAI.json.array(list) })
+end
+
+function W.submitRequest(playerGroupName, text, markPos)
+	local pg = Group.getByName(playerGroupName)
+	if not (pg and pg:isExist()) then return false end
+	local gid = pg:getID()
+	local pu = playerUnitOf(pg)
+	if not pu then return false end
+	local sideName = SIDE_KEY[pg:getCoalition()]
+	if not sideName then return false end
+	local open = 0
+	for _, req in pairs(W.nl.pending) do if req.side == sideName then open = open + 1 end end
+	if open >= (nl.maxPending or 3) then
+		msg(gid, 'Wingman: say again in a moment, still working on the last call.')
+		return false
+	end
+	text = tostring(text):sub(1, 300)
+	local p = pu:getPoint()
+	local v = pu:getVelocity()
+	local flight = W.flights[playerGroupName]
+	W.nl.counter = W.nl.counter + 1
+	local id = string.format('%s-%d', sideName, W.nl.counter)
+	local packages = {}
+	local P = FAI.command and FAI.command.packages
+	for pid, pkg in pairs(P and P.bySide[sideName] or {}) do
+		if not pkg.pushed then
+			packages[#packages + 1] = { package = pid, target = pkg.target,
+				pushInMin = math.max(0, math.ceil((pkg.pushAt - timer.getAbsTime()) / 60)) }
+		end
+	end
+	local payload = {
+		id = id,
+		text = text,
+		player = { type = pu:getTypeName(), altFt = math.floor(p.y * 3.28084), headingDeg = math.floor((math.deg(headingOf(pu)) + 360) % 360),
+			speedKt = math.floor(math.sqrt(v.x * v.x + v.z * v.z) * 1.94384) },
+		wingmen = flight and flightSummary(flight) or nil,
+		mark = markPos and { bearingDeg = bearingDeg(p, markPos), distanceNm = math.floor(distance2D(p, markPos) / NM + 0.5) } or nil,
+		zones = FAI.json.array(zonesNear(p)),
+		packages = FAI.json.array(packages),
+	}
+	W.nl.pending[id] = { id = id, side = sideName, group = playerGroupName, markPos = markPos, at = timer.getTime(), payload = payload }
+	if not writeRequests(sideName) then
+		W.nl.pending[id] = nil
+		msg(gid, 'Wingman: plain-language orders need the Foothold AI sidecar. Use the F10 menu.')
+		return false
+	end
+	FAI.log('wingman', 'request %s from %s: %s', id, playerGroupName, text)
+	return true
+end
+
+local KINDS = { ground = 'ground', air_defence = 'airDefence', ships = 'ships', any = 'any' }
+
+-- Where an action points: the player, the request's map mark, or a zone.
+local function placeOf(action, req, pg)
+	if action.where == 'mark' and req.markPos then return req.markPos, 'your mark' end
+	if action.where == 'zone' and type(action.zone) == 'string' then
+		local zp = zonePointByName(action.zone)
+		if zp then return { x = zp.x, y = 0, z = zp.z }, action.zone end
+		return nil, 'unknown zone ' .. action.zone
+	end
+	local pu = playerUnitOf(pg)
+	if pu then return pu:getPoint(), 'your position' end
+	return nil, 'no position'
+end
+
+local function runAction(action, req)
+	local name = req.group
+	local pg = Group.getByName(name)
+	if not (pg and pg:isExist()) or type(action) ~= 'table' then return end
+	local a = action.action
+	if a == 'request' then
+		requestWingmen(name, tonumber(action.count) == 3 and 3 or 1)
+	elseif a == 'join' or a == 'cover' then
+		withFlight(name, function(f, g)
+			if joinUp(f, a == 'cover') then msg(g:getID(), a == 'cover' and 'Covering you.' or 'Rejoining.') end
+		end)
+	elseif a == 'hold' then
+		withFlight(name, function(f, g)
+			local point, label = placeOf(action, req, g)
+			if point then holdAt(f, g, point, label) else msg(g:getID(), 'Wingman: ' .. label) end
+		end)
+	elseif a == 'attack' then
+		withFlight(name, function(f, g)
+			local kind = KINDS[action.kind] or 'ground'
+			local point, label = placeOf(action, req, g)
+			if not point then msg(g:getID(), 'Wingman: ' .. label) return end
+			local radius = math.max(1, math.min(20, tonumber(action.radius_nm) or cfg.attackRadiusNm[kind] or 5))
+			attackAt(f, g, point, kind, radius, label)
+		end)
+	elseif a == 'weapons' then
+		weapons(name, action.free == true)
+	elseif a == 'status' then
+		status(name)
+	elseif a == 'rtb' then
+		sendHome(name)
+	elseif a == 'dismiss' then
+		dismiss(name)
+	end
+end
+
+FAI.bridge.onOrders('wingman', function(sideName, orders)
+	for _, r in ipairs(type(orders.results) == 'table' and orders.results or {}) do
+		local req = type(r) == 'table' and W.nl.pending[r.id]
+		if req then
+			W.nl.pending[r.id] = nil
+			local pg = Group.getByName(req.group)
+			if pg and pg:isExist() and type(r.reply) == 'string' and r.reply ~= '' then
+				msg(pg:getID(), 'Wingman: ' .. r.reply:sub(1, 200), 12)
+			end
+			-- A new wingman needs a moment to spawn before it can take orders.
+			local delay = 0
+			for _, action in ipairs(type(r.actions) == 'table' and r.actions or {}) do
+				if delay == 0 then
+					local ok, err = pcall(runAction, action, req)
+					if not ok then FAI.warn('wingman', 'action %s failed: %s', tostring(action.action), tostring(err)) end
+				else
+					timer.scheduleFunction(function()
+						local ok, err = pcall(runAction, action, req)
+						if not ok then FAI.warn('wingman', 'action %s failed: %s', tostring(action.action), tostring(err)) end
+					end, nil, timer.getTime() + delay)
+				end
+				if type(action) == 'table' and action.action == 'request' then delay = delay + 3 end
+			end
+			FAI.log('wingman', 'request %s answered: %s', r.id, tostring(r.reply))
+		end
+	end
+end)
+
+-- The player who placed a mark, or else the closest player of that side.
+local function playerGroupForMark(event)
+	local init = event.initiator
+	if init and init.getGroup then
+		local ok, g = pcall(init.getGroup, init)
+		if ok and g and g:isExist() and playerUnitOf(g) then return g:getName() end
+	end
+	local best, bestD
+	for _, side in ipairs({ coalition.side.RED, coalition.side.BLUE }) do
+		if event.coalition == side or event.coalition == -1 then
+			for _, unit in ipairs(coalition.getPlayers(side) or {}) do
+				local d = distance2D(unit:getPoint(), event.pos)
+				if not bestD or d < bestD then best, bestD = unit:getGroup():getName(), d end
+			end
+		end
+	end
+	return best
+end
+
+function W.onMarkText(event, text)
+	if not nl.enabled then return end
+	local prefix = cfg.markPrefix:lower() .. ' '
+	if text:sub(1, #prefix) ~= prefix then return end
+	local order = text:sub(#prefix + 1):gsub('^%s+', '')
+	if order == '' then return end
+	local key = tostring(event.idx) .. ':' .. order
+	if W.nl.seenMarks[key] then return end
+	W.nl.seenMarks[key] = true
+	local groupName = playerGroupForMark(event)
+	if groupName then W.submitRequest(groupName, order, event.pos) end
+end
+
+-- Chat lines from the optional hook (Saved Games\DCS\Scripts\Hooks\FootholdAI_Chat.lua).
+local function pollChat()
+	if not (nl.enabled and nl.chatInbox and FAI.dir) then return end
+	local path = FAI.dir .. 'chat_inbox.lua'
+	local data = FAI.loadDataFile(path)
+	if type(data) ~= 'table' then
+		-- no inbox yet: every line that appears later is new
+		if W.nl.chatSeq == nil and not lfs.attributes(path) then W.nl.chatSeq = 0 end
+		return
+	end
+	local items = type(data.items) == 'table' and data.items or {}
+	local maxSeq = 0
+	for _, item in ipairs(items) do maxSeq = math.max(maxSeq, tonumber(item.seq) or 0) end
+	if W.nl.chatSeq == nil then W.nl.chatSeq = maxSeq return end   -- lines from before this mission
+	for _, item in ipairs(items) do
+		local seq = tonumber(item.seq) or 0
+		if seq > W.nl.chatSeq and type(item.text) == 'string' and type(item.name) == 'string' then
+			W.nl.chatSeq = math.max(W.nl.chatSeq, seq)
+			local lower = item.text:lower()
+			for _, prefix in ipairs(nl.chatPrefixes or {}) do
+				if lower:sub(1, #prefix) == prefix:lower() then
+					for _, side in ipairs({ coalition.side.RED, coalition.side.BLUE }) do
+						for _, unit in ipairs(coalition.getPlayers(side) or {}) do
+							if unit:getPlayerName() == item.name then
+								W.submitRequest(unit:getGroup():getName(), item.text:sub(#prefix + 1), nil)
+							end
+						end
+					end
+					break
+				end
+			end
+		end
+	end
+end
+
+local function expireRequests()
+	local now = timer.getTime()
+	for id, req in pairs(W.nl.pending) do
+		if now - req.at > (nl.timeoutSec or 90) then
+			W.nl.pending[id] = nil
+			local pg = Group.getByName(req.group)
+			if pg and pg:isExist() then msg(pg:getID(), 'Wingman: no answer (is the Foothold AI sidecar running?). Use the F10 menu.') end
+		end
+	end
+end
+
+if nl.enabled then
+	timer.scheduleFunction(function(_, t)
+		local ok, err = pcall(pollChat)
+		if not ok then FAI.warn('wingman', 'chat poll failed: %s', tostring(err)) end
+		ok, err = pcall(expireRequests)
+		if not ok then FAI.warn('wingman', 'request expiry failed: %s', tostring(err)) end
+		return t + 2
+	end, nil, timer.getTime() + 2)
+end
+
+W.api = { requestWingmen = requestWingmen, joinUp = joinUp, attackAt = attackAt, holdAt = holdAt,
+	weapons = weapons, status = status, sendHome = sendHome, dismiss = dismiss }
 
 ---------------------------------------------------------------------------
 -- Menus
@@ -564,6 +856,7 @@ local function onEvent(event)
 			else
 				W.marks[side][event.idx] = nil
 			end
+			W.onMarkText(event, text)
 		end
 		return
 	end
@@ -617,4 +910,5 @@ for _, side in ipairs({ coalition.side.RED, coalition.side.BLUE }) do
 	end
 end
 
-FAI.log('wingman', 'ready (maxWingmen=%d)', cfg.maxWingmen)
+FAI.log('wingman', 'ready (maxWingmen=%d, plain-language orders %s)', cfg.maxWingmen,
+	(cfg.naturalLanguage or {}).enabled and 'on' or 'off')

@@ -6,6 +6,7 @@ and Claude plans every few minutes through game tools while its standing orders 
 Batch 3 adds the credit economy and RED's player-like operations (deploy forces, exact upgrades, fire missions,
 helicopter raids, air assault, ambushes, jamming, AWACS, airlift).
 Batch 4 adds packages: flights launched together hold at an IP and push at a set time, so they reach the target together.
+Batch 5 lets players join those packages and give their wingman orders in plain words.
 The overall plan is in [PLAN.md](PLAN.md); credits and prices are explained in [ECONOMY.md](ECONOMY.md).
 
 ## Files
@@ -21,6 +22,8 @@ The overall plan is in [PLAN.md](PLAN.md); credits and prices are explained in [
 | `tools/foothold_ai/mcp_server.py` | The game tools Claude uses (query the situation, issue orders) |
 | `tools/foothold_ai/prompts/command_*.md` | System prompts for the RED commander and BLUE HQ (edit freely) |
 | `tools/foothold_ai/patch_miz.py` | Embeds the scripts in a `.miz` and adds the "Foothold AI" trigger |
+| `tools/foothold_ai/hooks/FootholdAI_Chat.lua` | Optional: lets wingman orders come from chat (copy to `Saved Games\DCS\Scripts\Hooks`) |
+| `tools/foothold_ai/prompts/wingman.md` | How Claude turns a plain-language order into wingman actions |
 | `tools/foothold_ai/sidecar.py` | Bridge between DCS and your local Claude Code (stdlib Python) |
 | `tools/foothold_ai/tests/` | Offline tests (`pip install lupa`, then `python -m unittest discover -s tools/foothold_ai/tests`) |
 
@@ -165,6 +168,27 @@ Re-patch the mission (a new file, `Foothold_AI_Packages.lua`, is added to the tr
 - [ ] Long holds: note any flight that goes home while holding (low fuel, Foothold's bingo rule).
 
 **Send back** the same files as before; `cycles\red_state.json` shows the packages and each flight's state.
+
+## Test batch 5 checklist (players in packages, plain-language wingman)
+
+Re-patch the mission. For chat orders (optional), copy `tools\foothold_ai\hooks\FootholdAI_Chat.lua` to `Saved Games\DCS\Scripts\Hooks\` and restart DCS; `dcs.log` then shows `chat hook loaded`. Chat orders only work when you host a multiplayer mission; F10 map marks work everywhere.
+
+**Joining a package** (BLUE slot, Claude commanding BLUE):
+- [ ] F10 > AI Packages > List packages shows Claude's open packages with push time and the IP bearing/distance from you. If none, AI Packages > Request support > SEAD (or CAP, CAS, Strike) should lead to a package within a cycle or two, usually with an `HQ:` message.
+- [ ] Join > Package 1: a message with the IP and push time, and two marks on your F10 map (IP and target).
+- [ ] Fly to the IP: "at the IP, hold". The AI flights of the package hold there too; the package pushes about a minute after everyone, you included, is at the IP (or at the push time).
+- [ ] "push in 5 minutes" / "push in 1 minute" calls, then "PUSH PUSH" with the target bearing.
+- [ ] AI Packages > Push now (while in a package): the AI flights leave the IP at once.
+- [ ] Leave package, or leaving your slot, takes you out of it.
+
+**Plain-language wingman** (request a wingman first, F10 > AI Wingman):
+- [ ] Place an F10 map mark with text `wm attack the SAM here` near an enemy SAM: within a few seconds the reply "Wingman: Two, ..." and the wingman attacks there.
+- [ ] Try other orders: `wm cover me`, `wm hold over <zone name>`, `wm hit the trucks at <zone name>`, `wm weapons hold`, `wm status`, `wm go home`.
+- [ ] Chat (with the hook): type `wm rejoin` in chat.
+- [ ] A mark with only `wm` still works as the target for Attack > My "wm" map mark.
+- [ ] Note any order it misunderstood, with the words you used: those go into `prompts\wingman.md`.
+
+`sidecar.log` shows each order, the actions Claude chose and the time it took (about 3 s in testing). The sidecar uses Sonnet with low effort for these; `--wingman-model opus` or `--wingman-effort medium` change that.
 
 ## Restarting the sidecar
 If you restart `sidecar.py` while the mission runs, it skips a planning request older than 2 minutes (it was answered already, or the mission will ask again). The mission ignores any answer to a request it is no longer waiting for, so a restart never doubles orders. If a cycle was cut off, the mission asks again after `requestTimeoutSec` (15 min).

@@ -41,6 +41,8 @@ end
 STUB.flags = {}
 trigger = { misc = { getUserFlag = function(f) return STUB.flags[f] and 1 or 0 end }, action = {
 	setUserFlag = function(f, v) STUB.flags[f] = (v == true or (tonumber(v) or 0) ~= 0) end,
+	markToGroup = function(id, text, pos, groupId) STUB.marks = STUB.marks or {}; STUB.marks[id] = { text = text, pos = pos, gid = groupId } end,
+	removeMark = function(id) if STUB.marks then STUB.marks[id] = nil end end,
 	outTextForGroup = function(gid, text) STUB.texts[#STUB.texts + 1] = { gid = gid, text = text } end,
 } }
 

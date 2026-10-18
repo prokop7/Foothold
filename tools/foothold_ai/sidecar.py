@@ -38,8 +38,8 @@ import agent  # noqa: E402
 STATE_SCHEMA = "footholdai.state.v1"
 ORDERS_SCHEMA = "footholdai.orders.v1"
 SIDES = ("red", "blue")
-STATE_KINDS = ("ping", "command")
-ASYNC_KINDS = {"command"}  # long Claude cycles run in the worker pool
+STATE_KINDS = ("ping", "command", "wingman")
+ASYNC_KINDS = {"command", "wingman"}  # Claude calls run in the worker pool
 STALE_STATE_SEC = 120      # at start-up, older command states were answered or abandoned
 LINK_TEST_REUSE_SEC = 300  # one Claude link test serves both sides for this long
 
@@ -192,11 +192,11 @@ class ClaudeCli:
         self.workdir = workdir
 
     def call(self, prompt: str, schema: dict, system_prompt_file: pathlib.Path | None = None,
-             effort: str | None = None) -> dict:
+             effort: str | None = None, model: str | None = None) -> dict:
         """Run one headless Claude call. Returns the validated structured output plus metadata."""
         args = [
             self.command, "-p",
-            "--model", self.model,
+            "--model", model or self.model,
             "--effort", effort or self.effort,
             "--output-format", "json",
             "--json-schema", json.dumps(schema, separators=(",", ":")),
@@ -250,6 +250,52 @@ class ClaudeCli:
             raise RuntimeError(f"claude returned non-JSON output: {proc.stdout[:300]!r}") from exc
 
 
+WINGMAN_ACTIONS = ["request", "join", "cover", "hold", "attack", "weapons", "status", "rtb", "dismiss"]
+WINGMAN_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "reply": {"type": "string"},
+        "actions": {"type": "array", "items": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": WINGMAN_ACTIONS},
+                "count": {"type": "integer", "enum": [1, 3]},
+                "kind": {"type": "string", "enum": ["ground", "air_defence", "ships", "any"]},
+                "where": {"type": "string", "enum": ["me", "mark", "zone"]},
+                "zone": {"type": "string"},
+                "radius_nm": {"type": "number"},
+                "free": {"type": "boolean"},
+            },
+            "required": ["action"],
+            "additionalProperties": False,
+        }},
+    },
+    "required": ["reply", "actions"],
+    "additionalProperties": False,
+}
+WINGMAN_PROMPT = pathlib.Path(__file__).resolve().parent / "prompts" / "wingman.md"
+
+
+def clean_wingman_actions(actions, request: dict) -> list[dict]:
+    """Keeps only well-formed actions that refer to things the request offered."""
+    zones = {z.get("name") for z in request.get("zones") or []}
+    out = []
+    for a in actions if isinstance(actions, list) else []:
+        if not isinstance(a, dict) or a.get("action") not in WINGMAN_ACTIONS:
+            continue
+        a = {k: v for k, v in a.items() if v is not None}
+        if a.get("where") == "zone" and a.get("zone") not in zones:
+            continue
+        if a.get("where") == "mark" and not request.get("mark"):
+            a["where"] = "me"
+        # Actions run at once: a join or cover after an attack or hold would cancel it
+        # (an attack rejoins by itself after about 10 minutes).
+        if a["action"] in ("join", "cover") and out and out[-1]["action"] in ("attack", "hold"):
+            continue
+        out.append(a)
+    return out[:4]
+
+
 PING_SCHEMA = {
     "type": "object",
     "properties": {"ack": {"type": "string"}},
@@ -279,8 +325,11 @@ class Bridge:
         self.last_seq: dict[tuple, tuple] = {}
         self.order_seq = 0
         self.seq_lock = threading.Lock()
-        self.pool = ThreadPoolExecutor(max_workers=3)  # one cycle per side, plus a link test
-        self.busy: set[str] = set()
+        self.pool = ThreadPoolExecutor(max_workers=6)  # per side: a cycle and a wingman call; a link test
+        self.busy: set[tuple] = set()
+        self.wingman_model = "sonnet"
+        self.wingman_effort = "low"
+        self.answered: set[str] = set()
         self.started_at = time.time()
         self.link_result: dict | None = None
         self.link_result_at = 0.0
@@ -364,6 +413,36 @@ class Bridge:
         self.link_result, self.link_result_at = result, time.monotonic()
         self.link_running = False
 
+    def on_wingman(self, side: str, state: dict) -> dict | None:
+        """Answers plain-language wingman orders, one fast Claude call each."""
+        session = state.get("session")
+        results = []
+        for req in (state.get("payload") or {}).get("requests") or []:
+            key = f"{session}:{req.get('id')}"
+            if not req.get("id") or key in self.answered:
+                continue
+            self.answered.add(key)
+            if not self.claude:
+                results.append({"id": req["id"], "reply": "No Claude in dry-run mode.", "actions": []})
+                continue
+            context = {k: v for k, v in req.items() if k != "text"}
+            prompt = (f"Pilot's order: {req.get('text', '')!r}\n\nSituation (JSON):\n"
+                      + json.dumps(context, ensure_ascii=False))
+            try:
+                res = self.claude.call(prompt, WINGMAN_SCHEMA, WINGMAN_PROMPT, effort=self.wingman_effort,
+                                       model=self.wingman_model)
+                out = res["output"]
+                actions = clean_wingman_actions(out.get("actions"), req)
+                results.append({"id": req["id"], "reply": str(out.get("reply", ""))[:200], "actions": actions})
+                log.info("%s: wingman %s %r -> %s in %d ms", side, req["id"], req.get("text"),
+                         [a["action"] for a in actions], res["latency_ms"])
+            except Exception as exc:  # tell the pilot instead of going silent
+                log.error("%s: wingman %s failed: %s", side, req.get("id"), exc)
+                results.append({"id": req["id"], "reply": "Say again, I did not get that.", "actions": []})
+        if not results:
+            return None
+        return {"kind": "wingman", "results": results}
+
     def on_command(self, side: str, state: dict) -> dict | None:
         if not self.claude:
             log.info("%s: planning request seq=%s skipped (dry run)", side, state.get("seq"))
@@ -376,20 +455,20 @@ class Bridge:
         try:
             self.handle(side, state)
         except Exception:
-            log.exception("%s: planning cycle seq=%s failed", side, state.get("seq"))
+            log.exception("%s: %s seq=%s failed", side, state.get("kind"), state.get("seq"))
         finally:
-            self.busy.discard(side)
+            self.busy.discard((side, state.get("kind")))
 
     def poll_once(self) -> None:
         for side in SIDES:
             for kind in STATE_KINDS:
-                if kind in ASYNC_KINDS and side in self.busy:
-                    continue  # newer request is read after the running cycle finishes
+                if kind in ASYNC_KINDS and (side, kind) in self.busy:
+                    continue  # newer request is read after the running one finishes
                 state = self.read_state(side, kind)
                 if not state:
                     continue
                 if kind in ASYNC_KINDS:
-                    self.busy.add(side)
+                    self.busy.add((side, kind))
                     self.pool.submit(self._handle_async, side, state)
                     continue
                 try:
@@ -421,6 +500,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--cycle-timeout", type=float, default=600.0,
                         help="seconds a planning cycle may take before it is stopped (default: 600)")
     parser.add_argument("--timeout", type=float, default=300.0, help="seconds per Claude call")
+    parser.add_argument("--wingman-model", default="sonnet",
+                        help="model for plain-language wingman orders (default: sonnet, for quick replies)")
+    parser.add_argument("--wingman-effort", default="low", choices=["low", "medium", "high", "xhigh", "max"],
+                        help="effort for wingman orders (default: low)")
     parser.add_argument("--poll", type=float, default=2.0, help="seconds between state polls")
     parser.add_argument("--dry-run", action="store_true", help="never call Claude")
     parser.add_argument("--check", action="store_true", help="run one Claude link test and exit")
@@ -451,7 +534,9 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     try:
-        Bridge(exchange, claude, args.cycle_effort, args.cycle_timeout).run(args.poll)
+        bridge = Bridge(exchange, claude, args.cycle_effort, args.cycle_timeout)
+        bridge.wingman_model, bridge.wingman_effort = args.wingman_model, args.wingman_effort
+        bridge.run(args.poll)
     except KeyboardInterrupt:
         log.info("stopped")
     return 0
