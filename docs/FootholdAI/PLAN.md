@@ -70,6 +70,7 @@ Exchange folder: <Saved Games>\DCS\Missions\Saves\FootholdAI\                   
 | `player_tasks` (BLUE) | `selectMissionTarget` |
 | `trigger_event` (RED) | `evc` scripted events; priced, with a cooldown per event |
 | `cancel_orders` | Drops delayed orders from earlier cycles that have not run yet |
+| `create_package` + `package` on launches | Each air flight, once 10 nm from its base, gets an Orbit at the package IP pushed on top of its Foothold mission (`Controller.pushTask` of a `ControlledTask`). The orbit ends by itself at the flight's push time, or earlier when the mission sets the flight's user flag (every flight holding). DCS then resumes the flight's own route. If Foothold re-tasks a holding flight (SEAD retarget, CAP routing), the hold is pushed again; a flight Foothold sends home leaves the package |
 | `hq_message` (BLUE) | coalition text |
 | `standing_orders` | Lua rules: `enemy_air_near` (EWRS radar contacts), `zone_attacked` (AIEN reports, RED), `zone_lost`; with cooldown, max active, and `$zone` substitution |
 | `deploy_forces` (RED) | `CustomZone:spawnGroup` with the mission's own RED zone templates; saved to `ops_*.lua` and respawned at start |
@@ -92,7 +93,7 @@ Denied launches (e.g. runway blocked, origin lost) are cleaned up like the Direc
 | 2 | ~~Bias commander~~ replaced by **Claude command mode** (above) | done (batch 2) |
 | 3 | Credit economy and RED player-like operations (waves 1 and 2 of [RED_TOOLKIT.md](RED_TOOLKIT.md)) | done (batch 3) |
 | 3b | Wave 3: recon → intel, hunting BLUE FARPs and CTLD sites, RED forward FARPs | planned |
-| 4 | Package timing in Lua: IP hold and push time, so packages hit together regardless of start-up delays (today Claude times with `delaySec`) | planned |
+| 4 | Package timing in Lua: IP hold and push time, so packages hit together regardless of start-up delays (`Foothold_AI_Packages.lua`) | done (batch 4) |
 | 5 | Player joins AI packages; natural-language wingman | planned |
 
 ## Things that must be checked in DCS, not assumed

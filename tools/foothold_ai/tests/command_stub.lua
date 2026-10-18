@@ -123,6 +123,13 @@ function BattleCommander:fireAtZone(zone, group, precise, amount, perTarget)
 	return FS.fireError
 end
 function BattleCommander:jamRadarsAtZone(group, zone) called('originalJam', group, zone) end
+function BattleCommander:EngageSeadMission(tgtzone, groupname) called('EngageSeadMission', groupname) return 'route' end
+function BattleCommander:EngageCasMission(tgtzone, groupname) called('EngageCasMission', groupname) end
+function BattleCommander:EngageRunwayBombing(home, tgt, groupName) called('EngageRunwayBombing', groupName) end
+GroupCommander = {}
+GroupCommander.__index = GroupCommander
+function GroupCommander:_assignCapTask() called('assignCapTask', self.name) end
+function GroupCommander:_startCapReturnHome(reason) called('capReturnHome', self.name, reason) return true end
 function BattleCommander:addFunds(side, amount) self.accounts[side] = math.max(0, self.accounts[side] + amount) end
 function BattleCommander:_getPendingShopReservedCredits(side) return 0 end
 function BattleCommander:_zoneSupportsPlaneSpawn(z) return z.isPlaneSpawn == true end

@@ -29,7 +29,7 @@ PLAYER_TASK_ROLES = ["CAS", "SEAD", "DEAD", "CAPTURE", "RUNWAYSTRIKE", "ATTACK_S
 TRIGGERS = ["enemy_air_near", "zone_attacked", "zone_lost"]
 # Pre-built capability role -> free-form role whose price the capability fee is based on.
 FEE_ROLE = {"CAP": "CAP", "CAS": "CAS", "SEAD": "SEAD", "RUNWAYSTRIKE": "RUNWAY_STRIKE"}
-NUMERIC_ARGS = ("delay_min", "fraction", "heading_deg", "leg_nm")
+NUMERIC_ARGS = ("delay_min", "fraction", "heading_deg", "leg_nm", "push_in_min", "ip_nm", "push_offset_min")
 
 
 def sanitize_id(text: str) -> str:
@@ -61,6 +61,8 @@ class GameTools:
         self.deploy_queued: dict[str, int] = {}
         self.ops_queued: set = set()
         self.freeform_queued: set[str] = set()
+        self.packages = {pk["package"]: pk for pk in self.p.get("packages", [])}
+        self.packages_queued: dict[str, dict] = {}
         self.flights_queued = 0
         self.ambush_queued = 0
         self.purchased = False
@@ -111,6 +113,23 @@ class GameTools:
             return 0
         role = self.roles.get(FEE_ROLE.get(c.get("role"), "CONVOY")) or {}
         return int((role.get("price") or 1000) * frac)
+
+    def package_fields(self, order: dict, package, push_offset_min, delay_min) -> str:
+        """Adds package membership to a launch order; returns a note for the result."""
+        if package is None:
+            return ""
+        pkg = self.packages_queued.get(package) or self.packages.get(package)
+        if not pkg:
+            raise ValueError(f"unknown package {package!r}; create it first with create_package")
+        if pkg.get("pushedMinAgo") is not None:
+            raise ValueError(f"package {package} has already pushed")
+        if delay_min:
+            raise ValueError("package flights launch now and hold at the IP; do not combine with delay_min")
+        order["package"] = package
+        offset = float(push_offset_min or 0)
+        if offset:
+            order["pushOffsetMin"] = max(-10.0, min(10.0, offset))
+        return f"; joins package {package}" + (f", pushes {order['pushOffsetMin']:+g} min" if offset else "")
 
     def red_only(self, what: str):
         if self.side != "red":
@@ -165,6 +184,7 @@ class GameTools:
             "orderResultsSinceLastCycle": p.get("orderResults", []),
             "standingOrders": p.get("standingOrders", []),
             "delayedOrdersPending": p.get("scheduledOrders", []),
+            "packages": p.get("packages", []),
             "supplyPriorities": p.get("supplyPriorities") or {},
             "yourNotesFromLastCycle": self.memory.get("notes", ""),
             "recentCycles": self.memory.get("history", [])[:5],
@@ -243,7 +263,7 @@ class GameTools:
         return self.ops
 
     # -- order tools -----------------------------------------------------
-    def launch_capability(self, capability, target_zone=None, delay_min=0):
+    def launch_capability(self, capability, target_zone=None, delay_min=0, package=None, push_offset_min=0):
         delay_min = float(delay_min or 0)
         c = self.caps.get(capability)
         if not c:
@@ -264,15 +284,18 @@ class GameTools:
                 raise ValueError(f"role {c.get('role')} cannot be sent to another target; "
                                  "use launch_mission for a free-form mission")
             order["targetZone"] = target_zone
+        if package is not None and c.get("domain") == "surface":
+            raise ValueError("ground units cannot hold at an IP; launch them without a package")
+        note = self.package_fields(order, package, push_offset_min, delay_min)
         fee = self.cap_fee(c)
         if fee:
             self.spend(fee, f"the sortie fee for {capability}")
         self.queued_caps.add(capability)
         target = order.get("targetZone", c["target"])
         eta = self.eta_min(c["origin"], target, "surface" if c.get("domain") == "surface" else "air")
-        return self.add_order(order, delay_min) + f" ({c['origin']} -> {target}, about {eta} min flight)"
+        return self.add_order(order, delay_min) + f" ({c['origin']} -> {target}, about {eta} min flight{note})"
 
-    def launch_mission(self, origin, role, target_zone, delay_min=0, template=None):
+    def launch_mission(self, origin, role, target_zone, delay_min=0, template=None, package=None, push_offset_min=0):
         r = self.roles.get(role)
         if not r:
             raise ValueError(f"role {role!r} not available for this side; options: {sorted(self.roles)}")
@@ -295,15 +318,18 @@ class GameTools:
         if ff_id in self.freeform_queued or (existing and existing.get("state")):
             raise ValueError(f"the same {role} mission from {origin} to {target_zone} is already flying or ordered; "
                              "use another origin, role or template")
-        self.freeform_queued.add(ff_id)
-        price = int(r.get("price", 0))
-        self.spend(price, "the mission")
-        eta = self.eta_min(origin, target_zone, "surface" if r.get("domain") == "surface" else
-                           ("helicopter" if role == "CAS_HELO" else "air"))
         order = {"type": "launch_mission", "origin": origin, "role": role, "targetZone": target_zone}
         if template is not None:
             order["template"] = template
-        return self.add_order(order, delay_min) + \
+        if package is not None and r.get("domain") == "surface":
+            raise ValueError("ground units cannot hold at an IP; launch them without a package")
+        note = self.package_fields(order, package, push_offset_min, delay_min)
+        price = int(r.get("price", 0))
+        self.spend(price, "the mission")   # last check: nothing is reserved if an earlier one fails
+        self.freeform_queued.add(ff_id)
+        eta = self.eta_min(origin, target_zone, "surface" if r.get("domain") == "surface" else
+                           ("helicopter" if role == "CAS_HELO" else "air"))
+        return self.add_order(order, delay_min) + note + \
             f" (cost {price}, about {eta} min to target; the mission re-checks aircraft and stock at launch)"
 
     def purchase(self, item, zone=None, category=None, targets=None):
@@ -606,6 +632,29 @@ class GameTools:
             f"({jammer.get('longRangeSamRangeNm')} nm for long-range SAMs) hold fire " \
             f"for up to {jammer.get('minutes')} min while it lives - escort it)"
 
+    def create_package(self, package, target_zone, push_in_min=20, ip_nm=30, from_zone=None, push_when_ready=True):
+        if not isinstance(package, str) or not package.strip():
+            raise ValueError("package needs a short name")
+        package = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in package)[:30]
+        existing = self.packages.get(package)
+        if package in self.packages_queued or (existing and existing.get("pushedMinAgo") is None):
+            raise ValueError(f"package {package} already exists and has not pushed")
+        if target_zone not in self.zones:
+            raise ValueError(f"unknown target zone {target_zone!r}")
+        if from_zone is not None and not self.own(from_zone):
+            raise ValueError("from_zone must be one of your zones")
+        push = max(10.0, min(45.0, float(push_in_min)))
+        order = {"type": "create_package", "package": package, "targetZone": target_zone, "pushInMin": push,
+                 "ipNm": max(10.0, min(80.0, float(ip_nm))), "pushWhenReady": bool(push_when_ready)}
+        if from_zone is not None:
+            order["fromZone"] = from_zone
+        self.packages_queued[package] = order
+        note = " (push time moved to the 10-45 min range)" if push != float(push_in_min) else ""
+        return self.add_order(order, 0) + f"{note}. Now launch its flights with package={package!r}."
+
+    def list_packages(self):
+        return self.p.get("packages", [])
+
     def cancel_orders(self, order_ids):
         pending = {o["order"] for o in self.p.get("scheduledOrders", [])}
         unknown = [i for i in order_ids if i not in pending]
@@ -632,7 +681,11 @@ def _s(type_, desc=None, **extra):
 def tool_specs(side: str) -> list[dict]:
     obj = lambda props, req=(): {"type": "object", "properties": props, "required": list(req),  # noqa: E731
                                  "additionalProperties": False}
-    delay = _s("number", "Minutes to wait before launching (0-60). Use it to time packages to a common TOT.")
+    delay = _s("number", "Minutes to wait before launching (0-60). For flights that must arrive together, "
+                         "prefer a package.")
+    pkg_arg = _s("string", "Package name from create_package: launch now, hold at its IP, push with it.")
+    offset_arg = _s("number", "Minutes after (+) or before (-) the package push this flight leaves the IP, "
+                              "e.g. SEAD 0, strike +2 (-10..10).")
     specs = [
         ("get_overview", "Start here. Economy, front line, missions in progress, results of your last orders, "
                          "events since the last cycle, standing orders and your notes from last cycle.", obj({})),
@@ -649,15 +702,27 @@ def tool_specs(side: str) -> list[dict]:
         ("list_enemy_air", "Enemy aircraft your radars currently detect.", obj({})),
         ("list_freeform_options", "Free-form mission roles with prices, and your air origins.", obj({})),
         ("launch_capability", "Launch a pre-built capability now or after a delay. CAP/CAS/SEAD/RUNWAYSTRIKE "
-                              "capabilities can be sent to a different target_zone.",
-         obj({"capability": _s("string"), "target_zone": _s("string"), "delay_min": delay}, ["capability"])),
+                              "capabilities can be sent to a different target_zone. With package, the flight "
+                              "launches now and holds at the package IP until the push.",
+         obj({"capability": _s("string"), "target_zone": _s("string"), "delay_min": delay,
+              "package": pkg_arg, "push_offset_min": offset_arg}, ["capability"])),
         ("launch_mission", "Free-form mission from any own origin to any target, paid from credits. "
                            "Roles: CAP (defensive patrol over target), SWEEP (fighter sweep), CAS, CAS_HELO, SEAD, "
                            "RUNWAY_STRIKE, CONVOY, ARTY. Optional template picks the exact aircraft and loadout "
                            "(list_freeform_options shows each role's templates); without it Foothold picks one.",
          obj({"origin": _s("string"), "role": _s("string"), "target_zone": _s("string"), "delay_min": delay,
-              "template": _s("string")},
+              "template": _s("string"), "package": pkg_arg, "push_offset_min": offset_arg},
              ["origin", "role", "target_zone"])),
+        ("create_package", "Create a strike package: its flights launch now, hold in an orbit at an IP ip_nm from "
+                           "the target (toward from_zone, or your zone nearest the target) and push together at "
+                           "push_in_min (10-45; aircraft start cold, so allow 10+ min), or earlier once every "
+                           "flight is holding when push_when_ready. Then add flights with package= on "
+                           "launch_capability / launch_mission (air only).",
+         obj({"package": _s("string"), "target_zone": _s("string"), "push_in_min": _s("number"),
+              "ip_nm": _s("number"), "from_zone": _s("string"), "push_when_ready": _s("boolean")},
+             ["package", "target_zone"])),
+        ("list_packages", "Your packages: push time, IP, and each flight's state (waiting, holding, released, "
+                          "direct = arrived after the push or past the IP, aborted, lost).", obj({})),
         ("set_supply_priority", "Steer the automatic supply dispatcher for a zone: high, normal, low, or none "
                                 "(starve it).",
          obj({"zone": _s("string"), "priority": _s("string", enum=["high", "normal", "low", "none"])},

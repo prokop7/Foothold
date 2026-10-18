@@ -104,6 +104,19 @@ FAI.defaults = {
 			event = 1000,               -- trigger_event (scripted RED events); per event: events = { scuds = 1500 }
 			events = {},
 		},
+		-- Packages (phase 4): flights of a package hold at an IP until the push time,
+		-- then continue their missions together.
+		packages = {
+			ipNm = 30,              -- IP distance from the target, toward own territory
+			holdStartNm = 10,       -- start holding only once this far from the origin (past the first waypoint)
+			minPushMin = 10,        -- earliest push after the package is created (aircraft start cold)
+			maxPushMin = 45,
+			pushWhenReadyDelaySec = 60, -- when every flight is holding, push this long after the last arrives
+			orbitSpeedMps = 180,
+			heloOrbitSpeedMps = 45,
+			flagBase = 77000,       -- user flags that release holding flights
+			keepMin = 30,           -- how long a pushed package stays in the snapshot
+		},
 		eventCooldownSec = 3600,        -- per scripted event
 		massAttackCooldownSec = 3600,
 		ops = {

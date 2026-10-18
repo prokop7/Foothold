@@ -5,6 +5,7 @@ Batch 2 puts Claude **in command** of RED and BLUE: Foothold's own AI commander 
 and Claude plans every few minutes through game tools while its standing orders handle instant reactions.
 Batch 3 adds the credit economy and RED's player-like operations (deploy forces, exact upgrades, fire missions,
 helicopter raids, air assault, ambushes, jamming, AWACS, airlift).
+Batch 4 adds packages: flights launched together hold at an IP and push at a set time, so they reach the target together.
 The overall plan is in [PLAN.md](PLAN.md); credits and prices are explained in [ECONOMY.md](ECONOMY.md).
 
 ## Files
@@ -15,6 +16,7 @@ The overall plan is in [PLAN.md](PLAN.md); credits and prices are explained in [
 | `Common Scripts/Foothold_AI_Wingman.lua` | F10 "AI Wingman" menu |
 | `Common Scripts/Foothold_AI_Command.lua` | Takeover of Foothold's AI decisions, order executor, standing orders, snapshots, credits |
 | `Common Scripts/Foothold_AI_Ops.lua` | RED operations and the range-checked jamming for both sides |
+| `Common Scripts/Foothold_AI_Packages.lua` | Packages: hold at the IP, push together |
 | `tools/foothold_ai/agent.py` | Runs one Claude planning cycle per side (memory, personality, logs) |
 | `tools/foothold_ai/mcp_server.py` | The game tools Claude uses (query the situation, issue orders) |
 | `tools/foothold_ai/prompts/command_*.md` | System prompts for the RED commander and BLUE HQ (edit freely) |
@@ -150,6 +152,20 @@ Re-patch the mission (a new file, `Foothold_AI_Ops.lua`, is added to the trigger
 - Wingmen carry the slot's default loadout from the Mission Editor, not what you rearmed to.
 - Dismiss removes the aircraft instantly.
 
+## Test batch 4 checklist (packages)
+
+Re-patch the mission (a new file, `Foothold_AI_Packages.lua`, is added to the trigger).
+
+- [ ] `dcs.log`: `[FootholdAI][packages] ready (IP 30 nm, hold from 10 nm out, push 10-45 min)`.
+- [ ] Claude creates a package (`create_package ... executed` in `dcs.log`) and launches its flights with it (`package <name>, holds at the IP` in the order result).
+- [ ] On the F10 map: each flight takes off, flies toward the IP (about 30 nm short of the target, on the RED side) and **orbits** there.
+- [ ] At the push time, or about a minute after the last flight reached the IP, the flights leave the IP together and fly their attack (`package <name> pushed` in `dcs.log`). Flights with an offset leave that many minutes later.
+- [ ] **Check after the push that each flight continues toward its target and does not turn back toward its airfield first.** If one does, note its role (CAS, SEAD, ...) and its base: the hold may start too early for that route (`command.packages.holdStartNm`, default 10).
+- [ ] A flight that takes off late (after the push) flies straight to the target.
+- [ ] Long holds: note any flight that goes home while holding (low fuel, Foothold's bingo rule).
+
+**Send back** the same files as before; `cycles\red_state.json` shows the packages and each flight's state.
+
 ## Restarting the sidecar
 If you restart `sidecar.py` while the mission runs, it skips a planning request older than 2 minutes (it was answered already, or the mission will ask again). The mission ignores any answer to a request it is no longer waiting for, so a restart never doubles orders. If a cycle was cut off, the mission asks again after `requestTimeoutSec` (15 min).
 
@@ -161,7 +177,7 @@ If you restart `sidecar.py` while the mission runs, it skips a planning request 
 - Only `deploy_forces` survives a mission restart; flights, batteries and teams in progress are lost on restart.
 
 ## Known limitations (batch 2)
-- Claude sets timing with launch delays. Foothold flights have no shared push point yet (phase 4), so arrival times can drift with start-up and taxi.
+- Without a package, Claude times flights with launch delays, which drift with start-up and taxi. Packages (batch 4) fix that.
 - Group size and loadout come from the mission's templates. Free-form missions can name one exact template; pre-built capabilities use what the map defines.
 - RED sees BLUE aircraft only through its radars (Foothold's EWRS registry); BLUE FARPs and ground units are not reported yet.
 - If the sidecar stops, nothing on the Claude sides acts (no fallback, by design) until it is running again.

@@ -38,7 +38,9 @@ function STUB.advance(seconds)
 	STUB.now = target
 end
 
-trigger = { action = {
+STUB.flags = {}
+trigger = { misc = { getUserFlag = function(f) return STUB.flags[f] and 1 or 0 end }, action = {
+	setUserFlag = function(f, v) STUB.flags[f] = (v == true or (tonumber(v) or 0) ~= 0) end,
 	outTextForGroup = function(gid, text) STUB.texts[#STUB.texts + 1] = { gid = gid, text = text } end,
 } }
 
@@ -69,6 +71,7 @@ Object = { Category = { UNIT = 1, WEAPON = 2, STATIC = 3 } }
 local Controller = {}
 Controller.__index = Controller
 function Controller:setTask(task) self.task = task; self.history[#self.history + 1] = task end
+function Controller:pushTask(task) self.pushed = self.pushed or {}; self.pushed[#self.pushed + 1] = task end
 function Controller:resetTask() self.task = nil end
 function Controller:setOption(id, value) self.options[id] = value end
 function Controller:setCommand(cmd) self.commands[#self.commands + 1] = cmd end
